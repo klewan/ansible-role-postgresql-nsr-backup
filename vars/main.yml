@@ -1,0 +1,8 @@
+---
+
+postgresql_nsr_backup_instance_directory: "{{ postgresql_nsr_backup_datavg_mountpoint_prefix }}/{{ item.0.name }}{% if item.1.mntp_suffix != '' %}/{{ item.1.mntp_suffix }}{% else %}{% endif %}"
+
+postgresql_nsr_backup_database_directory: "{{ postgresql_nsr_backup_datavg_mountpoint_prefix }}/{{ pg_instance.name }}/{{ item.0.name }}_{{ item.1.name_suffix }}"
+
+postgresql_nsr_backup_cron_disabled_item: "{% if postgresql_nsr_backup_cron_disable_jobs %}yes{% else %}{{ item.disabled|default('no',true) }}{% endif %}"
+

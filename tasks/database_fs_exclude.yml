@@ -1,0 +1,16 @@
+---
+
+- name: create .nsr files (databases)
+  template:
+    src: dot_nsr_database.j2
+    dest: "{{ postgresql_nsr_backup_database_directory }}/.nsr"
+    mode: 0644
+  with_subelements:
+    - "{{ pg_instance.databases }}"
+    - tablespaces
+  loop_control:
+    label: "[file: {{ postgresql_nsr_backup_database_directory }}/.nsr]"
+  when: postgresql_nsr_backup_configure_dot_nsr_files
+  tags:
+    - postgresql_nsr_backup_configure_dot_nsr_files
+

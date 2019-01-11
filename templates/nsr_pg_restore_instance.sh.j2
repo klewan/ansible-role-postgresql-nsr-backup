@@ -1,0 +1,800 @@
+#!/bin/sh
+# File: pg_nsr_restore_instance.sh
+#
+# Restore and recover PostgreSQL instance from NetWorker
+#
+# History:
+#
+# Date       Author       Comments
+# ---------- ------------ ----------------------------------------------
+# 25/10/2018 KLewandowski Created
+# ----------------------------------------------------------------------
+#
+
+
+#
+# Variables
+#
+
+BASE_PATH=/usr/lib64/qt-3.3/bin:/usr/local/bin:/bin:/usr/bin:/usr/local/sbin:/usr/sbin:$PATH:$HOME/.local/bin:$HOME/bin
+
+DIR=$(dirname $0)
+SCRIPT="$(basename $0 .sh)"
+CURRENT_TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+NSR_SERVER=$(awk ' $1!~ /[#*]/ {print $1} ' /nsr/res/servers 2>/dev/null| head -1)
+NSR_CLIENT="$(hostname -s)-nsr.$(echo $NSR_SERVER | awk -F. '{$1="";OFS="." ; print $0}' | sed 's/^.//')"
+VERBOSE=0
+ECHO_INFO="INFO> "
+ECHO_ERROR="ERROR> "
+ARCHIVE_DIR_PREFIX={{ postgresql_nsr_backup_default_archive_dir_prefix }}
+RECOVER=$(which recover)
+MODE="restore-and-recover"
+TABLESPACE_MAPPING_LIST=""
+RECOVER_PGPORT=7777
+RECOVER_CLUSTER_NAME=RECOVER
+
+#
+# Parameters (default values)
+#
+
+#
+# Functions
+#
+
+function usage()
+{
+  cat <<EOT
+
+Restore and recover PostgreSQL instance from NetWorker server
+
+Usage:
+  $0 [OPTION]...
+
+Options:
+   -h, --help                    show this help, then exit (optional)
+   -v, --verbose                 verbose mode (optional)
+   -i, --instance=INSTANCENAME   run restore/recovery for this PostgreSQL instance (mandatory)
+   -g, --savegroup=SAVEGROUP     run restore for this NetWorker save group (optional)
+   -c, --backup-client=CLIENT    name of the machine that saved the files (optional) [default: $(hostname -s)]
+   -m, --mode=MODE               
+                                 run this script in one of available modes: (optional) [default: $MODE]
+                                   restore - restore the instnace only, do not perform recovery
+                                   recover - perform recovery only; it assumes the instance is already restored
+                                   restore-and-recover - restore and recover the specified PostgreSQL instance
+   -M, --tablespace-mapping=olddir=newdir
+                                 relocate the tablespace in directory olddir to newdir during the restore
+                                 both 'olddir' and 'newdir' must be absolute paths
+                                 this option can be specified multiple times for multiple tablespaces
+                                 if a tablespace is relocated in this way, the symbolic links inside the main data directory are updated 
+                                   to point to the new location
+                                 (mandatory) for safety, this option is mandatory in 'restore' and 'restore-and-recover' modes
+                                   when restoring to original locations use --tablespace-mapping=original-locations keyword
+   -t, --from-tag=FROM_TAG
+                                 applicable only in 'restore' mode (optional)
+                                 restore the PostgreSQL instance from a FULL backup based on the specified TAG (TAG<date>T<time>)
+   -T, --to-tag=TO_TAG
+                                 applicable in 'recover' and 'restore-and-recover' modes (optional)
+                                 recover the PostgreSQL instance up to the specified TAG of WAL file archives backup (TAG<date>T<time>)
+   -f, --from-time=FROM_TIME          
+                                 applicable only in 'restore' mode (optional)
+                                 restore the PostgreSQL instance from a FULL backup based on the specified TIME (upper limit)
+   -u, --until-time=UNTIL_TIME
+                                 applicable in 'recover' and 'restore-and-recover' modes (optional)
+                                 recover the PostgreSQL instance up to the specified TIME (upper limit) (TAG<date>T<time>)
+                                   e.g.: "2018-10-26 12:30:00"
+   -d, --restore-pgdata-dir=DIRECTORY
+                                 the destination directory to relocate recovered files of a FULL backup 
+                                 (mandatory in 'restore' and 'restore-and-recover' modes)
+   -a, --restore-archive-dir=DIRECTORY
+                                 the destination directory to relocate recovered WAL file archives
+                                 (optional) [default: ${ARCHIVE_DIR_PREFIX}/INSTANCENAME/restore]
+   -H, --pghome-dir=DIRECTORY
+                                 applicable in 'recover' and 'restore-and-recover' modes (mandatory)
+                                 PostgreSQL binaries home used for recovery
+   -p, --recover-pgport=PORT
+                                 applicable in 'recover' and 'restore-and-recover' modes (optional) [default: $RECOVER_PGPORT]
+                                 port used during recovery process
+   -n, --recover-cluster-name=NAME
+                                 applicable in 'recover' and 'restore-and-recover' modes (optional) [default: $RECOVER_CLUSTER_NAME]
+                                 cluster_name used during recovery process
+   -L, --log-dir=DIRECTORY       send session log to this directory (optional)
+
+EOT
+}
+
+
+#
+# args parsing
+#
+
+while (( "$#" )); do
+  case "$1" in
+    -i)
+      INSTANCENAME=$2
+      shift 2
+      ;;
+    --instance=*)
+      INSTANCENAME="${1#*=}"
+      shift
+      ;;
+    -n)
+      RECOVER_CLUSTER_NAME=$2
+      shift 2
+      ;;
+    --recover-cluster-name=*)
+      RECOVER_CLUSTER_NAME="${1#*=}"
+      shift
+      ;;
+    -p)
+      RECOVER_PGPORT=$2
+      shift 2
+      ;;
+    --recover-pgport=*)
+      RECOVER_PGPORT="${1#*=}"
+      shift
+      ;;
+    -H)
+      RECOVER_PGHOME=$2
+      shift 2
+      ;;
+    --pghome-dir=*)
+      RECOVER_PGHOME="${1#*=}"
+      shift
+      ;;
+    -d)
+      RESTORE_PGDATA_DIR=$2
+      shift 2
+      ;;
+    --restore-pgdata-dir=*)
+      RESTORE_PGDATA_DIR="${1#*=}"
+      shift
+      ;;
+    -a)
+      RESTORE_ARCHIVE_DIR=$2
+      shift 2
+      ;;
+    --restore-archive-dir=*)
+      RESTORE_ARCHIVE_DIR="${1#*=}"
+      shift
+      ;;
+    -M)
+      TABLESPACE_MAPPING_LIST="$TABLESPACE_MAPPING_LIST $2"
+      shift 2
+      ;;
+    --tablespace-mapping=*)
+      NEW_MAPPING="${1#*=}"
+      TABLESPACE_MAPPING_LIST="$TABLESPACE_MAPPING_LIST $NEW_MAPPING"
+      shift
+      ;;
+    -c)
+      BACKUP_CLIENT=$2
+      shift 2
+      ;;
+    --backup-client=*)
+      BACKUP_CLIENT="${1#*=}"
+      shift
+      ;;
+    -m)
+      MODE=$2
+      shift 2
+      ;;
+    --mode=*)
+      MODE="${1#*=}"
+      shift
+      ;;
+    -g)
+      SAVEGROUP=$2
+      shift 2
+      ;;
+    --savegroup=*)
+      SAVEGROUP="${1#*=}"
+      shift
+      ;;
+    -t)
+      FROM_TAG=$2
+      shift 2
+      ;;
+    --from-tag=*)
+      FROM_TAG="${1#*=}"
+      shift
+      ;;
+    -T)
+      TO_TAG=$2
+      shift 2
+      ;;
+    --to-tag=*)
+      TO_TAG="${1#*=}"
+      shift
+      ;;
+    -f)
+      FROM_TIME=$2
+      shift 2
+      ;;
+    --from-time=*)
+      FROM_TIME="${1#*=}"
+      shift
+      ;;
+    -u)
+      UNTIL_TIME=$2
+      shift 2
+      ;;
+    --until-time=*)
+      UNTIL_TIME="${1#*=}"
+      shift
+      ;;
+    -L)
+      LOG_DIR=$2
+      shift 2
+      ;;
+    --log-dir=*)
+      LOG_DIR="${1#*=}"
+      shift
+      ;;
+    -v|--verbose)
+      VERBOSE=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      shift
+      exit 0
+      ;;
+    -*|--*=) # unsupported flags
+      echo "ERROR: Unsupported flag $1" >&2
+      usage
+      exit 1
+      ;;
+    *)
+      echo "ERROR: Unknown parameter $1" >&2
+      usage
+      exit 1
+      ;;
+  esac
+done
+
+if [ -z "$BACKUP_CLIENT" ]; then
+  BACKUP_CLIENT=$(hostname -s)
+fi
+
+NSR_CLIENT="${BACKUP_CLIENT}-nsr.$(echo $NSR_SERVER | awk -F. '{$1="";OFS="." ; print $0}' | sed 's/^.//')"
+
+if [ -z "$INSTANCENAME" ]; then
+  echo "${ECHO_ERROR}: Mandatory parameter '--instance=INSTANCENAME' not provided"
+  usage
+  exit 1
+fi
+
+if [ -z "$RESTORE_PGDATA_DIR" ] && [ "$MODE" == "restore" -o "$MODE" == "restore-and-recover" ]; then
+  echo "${ECHO_ERROR}: Mandatory (in 'restore' and 'restore-and-recover' modes) parameter '--restore-pgdata-dir=DIRECTORY' not provided"
+  usage
+  exit 1
+fi
+
+if [ -z "$RECOVER_PGHOME" ] && [ "$MODE" == "recover" -o "$MODE" == "restore-and-recover" ]; then
+  echo "${ECHO_ERROR}: Mandatory (in 'recover' and 'restore-and-recover' modes) parameter '--pghome-dir=DIRECTORY' not provided"
+  usage
+  exit 1
+fi
+
+if [ "$TABLESPACE_MAPPING_LIST" == "" ] && [ "$MODE" == "restore" -o "$MODE" == "restore-and-recover" ]; then
+  echo "${ECHO_ERROR}: Mandatory parameter '--tablespace-mapping' not provided"
+  usage
+  exit 1
+fi
+
+if [ ! -z "$LOG_DIR" ]; then
+  echo "Logfile -> $LOG_DIR/${SCRIPT}.${INSTANCENAME}.${CURRENT_TIMESTAMP}"
+  exec 1>>$LOG_DIR/${SCRIPT}.${INSTANCENAME}.${CURRENT_TIMESTAMP} 2>&1
+fi
+
+if [ -z "$SAVEGROUP" ]; then
+  SAVEGROUPdbfull="{{ postgresql_nsr_backup_default_savegroup_prefix }}_${INSTANCENAME}_${BACKUP_CLIENT}_dbfull"
+  SAVEGROUPdbarch="{{ postgresql_nsr_backup_default_savegroup_prefix }}_${INSTANCENAME}_${BACKUP_CLIENT}_dbarch"
+  SAVEGROUP=$SAVEGROUPdbfull
+else
+  SAVEGROUPdbfull=$(echo $SAVEGROUP | sed 's/arch$/full/')
+  SAVEGROUPdbarch=$(echo $SAVEGROUP | sed 's/full$/arch/')
+fi
+
+SAVEGROUP_QUERY="group=${SAVEGROUPdbfull},group=${SAVEGROUPdbarch}"
+
+if [ ! -z "$FROM_TAG" ] && [ "$MODE" != "restore" -o ! -z "$TO_TAG" -o ! -z "$FROM_TIME" -o ! -z "$UNTIL_TIME" ]; then
+  echo "${ECHO_ERROR}: --from-tag is applicable only in 'restore' mode and without --to-tag --from-time or --until-time options"
+  usage
+  exit 1
+fi
+
+if [ ! -z "$TO_TAG" ] && [ "$MODE" == "restore" -o ! -z "$FROM_TAG" -o ! -z "$FROM_TIME" -o ! -z "$UNTIL_TIME" ]; then
+  echo "${ECHO_ERROR}: --to-tag is applicable only in 'recover' and 'restore-and-recover' modes and without --from-tag --from-time or --until-time options"
+  usage
+  exit 1
+fi
+
+if [ ! -z "$FROM_TIME" ] && [ "$MODE" != "restore" -o ! -z "$FROM_TAG" -o ! -z "$TO_TAG" -o ! -z "$UNTIL_TIME" ]; then
+  echo "${ECHO_ERROR}: --from-time is applicable only in 'restore' mode and without --from-tag --to-tag or --until-time options"
+  usage
+  exit 1
+fi
+
+if [ ! -z "$UNTIL_TIME" ] && [ "$MODE" == "restore" -o ! -z "$FROM_TAG" -o ! -z "$TO_TAG" -o ! -z "$FROM_TIME" ]; then
+  echo "${ECHO_ERROR}: --until-time is applicable only in 'recover' and 'restore-and-recover' modes and without --from-tag --to-tag or --from-time options"
+  usage
+  exit 1
+fi
+
+if [ -z "$RESTORE_ARCHIVE_DIR" ]; then
+  RESTORE_ARCHIVE_DIR=$ARCHIVE_DIR_PREFIX/$INSTANCENAME/restore
+fi
+
+#
+# The real stuff starts here
+#
+
+echo
+echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} $SCRIPT started at $(date +%Y-%m-%d_%H:%M:%S)"
+echo
+
+if [ $VERBOSE -eq 1 ]; then
+  echo "--> (PARAMETERS) :: INSTANCENAME:             $INSTANCENAME"
+  echo "--> (PARAMETERS) :: SAVEGROUP:                $SAVEGROUP"
+  echo "--> (PARAMETERS) :: BACKUP_CLIENT:            $BACKUP_CLIENT"
+  echo "--> (PARAMETERS) :: MODE:                     $MODE"
+  echo "--> (PARAMETERS) :: FROM_TAG:                 $FROM_TAG"
+  echo "--> (PARAMETERS) :: TO_TAG:                   $TO_TAG"
+  echo "--> (PARAMETERS) :: FROM_TIME                 $FROM_TIME"
+  echo "--> (PARAMETERS) :: UNTIL_TIME                $UNTIL_TIME"
+  echo "--> (PARAMETERS) :: RESTORE_PGDATA_DIR:       $RESTORE_PGDATA_DIR"
+  echo "--> (PARAMETERS) :: RESTORE_ARCHIVE_DIR:      $RESTORE_ARCHIVE_DIR"
+  echo "--> (PARAMETERS) :: RECOVER_PGHOME:           $RECOVER_PGHOME"
+  echo "--> (PARAMETERS) :: TABLESPACE_MAPPING_LIST:  $TABLESPACE_MAPPING_LIST"
+  echo "--> (PARAMETERS) :: LOG_DIR:                  $LOG_DIR"
+  echo
+fi
+
+if [ $VERBOSE -eq 1 ]; then
+  echo "--> (NSR) :: NSR_SERVER:  $NSR_SERVER"
+  echo "--> (NSR) :: NSR_CLIENT:  $NSR_CLIENT"
+  echo
+fi
+
+
+#
+# restore FULL backup
+#
+
+if [ "$MODE" == "restore" ] || [ "$MODE" == "restore-and-recover" ]; then
+
+  #
+  # find FULL backup saveset name
+  #
+
+  if [ ! -z "$FROM_TAG" ]; then
+    FULL_SAVESET_INFO=$(mminfo -s $NSR_SERVER -oRt -r 'name,savetime(22)' -q "client=${NSR_CLIENT},${SAVEGROUP_QUERY}" 2>/dev/null | grep -w PG_FULL_DATA_${INSTANCENAME}_${FROM_TAG} | head -1)
+    FULL_SAVETIME=$(echo $FULL_SAVESET_INFO | sed 's/^[^ ]* //')
+    FULL_SAVENAME=$(echo $FULL_SAVESET_INFO | cut -d" " -f1)
+
+    if [ "$FULL_SAVENAME" == "" ]; then
+      echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_ERROR} Cannot find a FULL backup for the specified tag $FROM_TAG"
+      exit 1
+    fi
+  fi
+
+  if [ ! -z "$TO_TAG" ]; then
+    NSR_UPPER_LIMIT_SAVETIME=$(mminfo -s $NSR_SERVER -oRt -r 'name,savetime(22)' -q "client=${NSR_CLIENT},${SAVEGROUP_QUERY}" 2>/dev/null | egrep -w "(PG_FULL_ARCH_${INSTANCENAME}_${TO_TAG}|PG_FULL_DATA_${INSTANCENAME}_${TO_TAG}|PG_FULL_TMAP_${INSTANCENAME}_${TO_TAG}|PG_ARCH_${INSTANCENAME}_${TO_TAG})" | tail -1 | sed 's/^[^ ]* //')
+    FULL_SAVESET_INFO=$(mminfo -s $NSR_SERVER -oRt -r 'name,savetime(22)' -q "client=${NSR_CLIENT},${SAVEGROUP_QUERY},savetime<${NSR_UPPER_LIMIT_SAVETIME}" 2>/dev/null | grep PG_FULL_DATA_${INSTANCENAME}_TAG | head -1)
+    FULL_SAVETIME=$(echo $FULL_SAVESET_INFO | sed 's/^[^ ]* //')
+    FULL_SAVENAME=$(echo $FULL_SAVESET_INFO | cut -d" " -f1)
+
+    if [ "$FULL_SAVENAME" == "" -o "$NSR_UPPER_LIMIT_SAVETIME" == "" ]; then
+      echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_ERROR} Cannot find a FULL backup for the specified tag $TO_TAG"
+      exit 1
+    fi
+  fi
+
+  if [ ! -z "$FROM_TIME" ]; then
+    NSR_FROM_TIME=$(date -d"${FROM_TIME}" +%m/%d/%Y" "%H:%M:%S)
+    FULL_SAVESET_INFO=$(mminfo -s $NSR_SERVER -oRt -r 'name,savetime(22)' -q "client=${NSR_CLIENT},${SAVEGROUP_QUERY},savetime<=${NSR_FROM_TIME}" 2>/dev/null | grep PG_FULL_ARCH_${INSTANCENAME}_TAG | head -1)
+    FULL_SAVETIME=$(echo $FULL_SAVESET_INFO | sed 's/^[^ ]* //')
+    FULL_SAVENAME=$(echo $FULL_SAVESET_INFO | cut -d" " -f1 | sed 's/PG_FULL_ARCH/PG_FULL_DATA/')
+
+    if [ "$FULL_SAVENAME" == "" ]; then
+      echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_ERROR} Cannot find a FULL backup for the specified --from-time $FROM_TIME"
+      exit 1
+    fi
+  fi
+
+  if [ ! -z "$UNTIL_TIME" ]; then
+    NSR_UNTIL_TIME=$(date -d"${UNTIL_TIME}" +%m/%d/%Y" "%H:%M:%S)
+    FULL_SAVESET_INFO=$(mminfo -s $NSR_SERVER -oRt -r 'name,savetime(22)' -q "client=${NSR_CLIENT},${SAVEGROUP_QUERY},savetime<=${NSR_UNTIL_TIME}" 2>/dev/null | grep PG_FULL_ARCH_${INSTANCENAME}_TAG | head -1)
+    FULL_SAVETIME=$(echo $FULL_SAVESET_INFO | sed 's/^[^ ]* //')
+    FULL_SAVENAME=$(echo $FULL_SAVESET_INFO | cut -d" " -f1 | sed 's/PG_FULL_ARCH/PG_FULL_DATA/')
+
+    if [ "$FULL_SAVENAME" == "" ]; then
+      echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_ERROR} Cannot find a FULL backup for the specified --until-time $UNTIL_TIME"
+      exit 1
+    fi
+  fi
+
+  if [ -z "$FROM_TAG" ] && [ -z "$TO_TAG" ] && [ -z "$FROM_TIME" ] && [ -z "$UNTIL_TIME" ]; then
+    echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} Restoring from the last FULL backup since neither (FROM_|TO_)TAG nor (FROM_|UNTIL_)TIME were specified"
+    FULL_SAVESET_INFO=$(mminfo -s $NSR_SERVER -oRt -r 'name,savetime(22)' -q "client=${NSR_CLIENT},${SAVEGROUP_QUERY}" 2>/dev/null | grep PG_FULL_DATA_${INSTANCENAME}_TAG | head -1)
+    FULL_SAVETIME=$(echo $FULL_SAVESET_INFO | sed 's/^[^ ]* //')
+    FULL_SAVENAME=$(echo $FULL_SAVESET_INFO | cut -d" " -f1)
+
+    if [ "$FULL_SAVENAME" == "" ]; then
+      echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_ERROR} Cannot find any FULL backup for the specified instance"
+      exit 1
+    fi
+  fi
+
+  echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} Ready to restore FULL backup from $FULL_SAVENAME ($FULL_SAVETIME) save set"
+
+  #
+  # but first, restore tablespace_map file
+  #
+
+  TMAP_SAVENAME=$(echo $FULL_SAVENAME | sed 's/PG_FULL_DATA/PG_FULL_TMAP/')
+
+  echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} Restore tablespace_map from $TMAP_SAVENAME save set"
+
+  mkdir -p $RESTORE_PGDATA_DIR
+  cd $RESTORE_PGDATA_DIR
+  ln -s $RESTORE_PGDATA_DIR $(basename $TMAP_SAVENAME)
+  COMMAND="$RECOVER -f -d $RESTORE_PGDATA_DIR -a $TMAP_SAVENAME -c $NSR_CLIENT"
+
+  echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} running $COMMAND"
+  eval $COMMAND
+
+  RC=$?
+
+  rm -f ${RESTORE_PGDATA_DIR}/$(basename $TMAP_SAVENAME)
+
+  if [ $RC -ne 0 ]; then
+    echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_ERROR} error occured during restoration of $TMAP_SAVENAME"
+    exit 1
+  fi
+
+  echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} Restored tablespace_map into ${RESTORE_PGDATA_DIR}/tablespace_map"
+
+  #
+  # restore FULL backup saveset
+  #
+
+  echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} Restore FULL backup from $FULL_SAVENAME ($FULL_SAVETIME) save set to ${RESTORE_PGDATA_DIR}"
+
+  mkdir -p $RESTORE_PGDATA_DIR
+  cd $RESTORE_PGDATA_DIR
+  ln -s $RESTORE_PGDATA_DIR $(basename $FULL_SAVENAME) 2>/dev/null
+
+  rm -f $RESTORE_PGDATA_DIR/NSR_PG_PIPE
+  mkfifo $RESTORE_PGDATA_DIR/NSR_PG_PIPE
+
+# TABLESPACE_MAPPING_LIST
+  mkdir -p $RESTORE_PGDATA_DIR/pg_tblspc
+  cd $RESTORE_PGDATA_DIR/pg_tblspc
+  cat $RESTORE_PGDATA_DIR/tablespace_map | while read -r LINE
+  do
+    TBS_OID=$(echo $LINE | awk '{ print $1 }')
+    TBS_PATH=$(echo $LINE | awk '{ print $2 }')
+
+    for TBS_MAP in $TABLESPACE_MAPPING_LIST; do
+      if [ "$TBS_MAP" != "original-locations" ]; then
+        FROM_PATH=$(echo $TBS_MAP | cut -d= -f1)
+        TO_PATH=$(echo $TBS_MAP | cut -d= -f2)
+
+        if [ "$TBS_PATH" == "$FROM_PATH" ]; then
+          TBS_PATH=$TO_PATH
+        fi
+      fi
+    done
+
+    echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} setting up a sym-link $RESTORE_PGDATA_DIR/pg_tblspc/$TBS_OID pointing to $TBS_PATH"
+    mkdir -p $TBS_PATH
+    ln -s $TBS_PATH $TBS_OID 2>/dev/null
+  done
+
+  cd $RESTORE_PGDATA_DIR
+
+  COMMAND="cat $RESTORE_PGDATA_DIR/NSR_PG_PIPE | tar --extract --dereference --ignore-zero --file - &"
+  echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} running $COMMAND"
+  eval $COMMAND
+ 
+  COMMAND="$RECOVER -f -d $RESTORE_PGDATA_DIR -a $FULL_SAVENAME/NSR_PG_PIPE -c $NSR_CLIENT"
+  echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} running $COMMAND"
+  eval $COMMAND
+
+  RC=$?
+
+  rm -f ${RESTORE_PGDATA_DIR}/$(basename $FULL_SAVENAME)
+  rm -f $RESTORE_PGDATA_DIR/NSR_PG_PIPE $RESTORE_PGDATA_DIR/.nsr $RESTORE_PGDATA_DIR/tablespace_map
+
+  if [ $RC -ne 0 ]; then
+    echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_ERROR} error occured during restoration of $FULL_SAVENAME"
+    exit 1
+  fi
+
+  mkdir -p $RESTORE_PGDATA_DIR/pg_xlog $RESTORE_PGDATA_DIR/pg_wal $RESTORE_PGDATA_DIR/pg_subtrans
+  mkdir -p $RESTORE_PGDATA_DIR/pg_replslot $RESTORE_PGDATA_DIR/pg_dynshmem $RESTORE_PGDATA_DIR/pg_notify
+  mkdir -p $RESTORE_PGDATA_DIR/pg_serial $RESTORE_PGDATA_DIR/pg_snapshots $RESTORE_PGDATA_DIR/pg_stat_tmp
+  chmod 700 $RESTORE_PGDATA_DIR/pg_subtrans
+  chmod 700 $RESTORE_PGDATA_DIR/pg_replslot $RESTORE_PGDATA_DIR/pg_dynshmem $RESTORE_PGDATA_DIR/pg_notify
+  chmod 700 $RESTORE_PGDATA_DIR/pg_serial $RESTORE_PGDATA_DIR/pg_snapshots $RESTORE_PGDATA_DIR/pg_stat_tmp
+
+  echo
+  echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} Restored FULL backup into $RESTORE_PGDATA_DIR"
+ 
+fi
+
+
+#
+# recover FULL backup
+#
+
+if [ "$MODE" == "recover" ] || [ "$MODE" == "restore-and-recover" ]; then
+
+  #
+  # initialize variables
+  #
+
+  unset PGDATABASE
+  unset PGHOME
+  unset PGDATA
+  unset PGPORT
+
+  PGHOME=$RECOVER_PGHOME
+  export PATH=${PGHOME}/bin:$PATH
+  PGDATABASE=${RECOVER_CLUSTER_NAME}
+  PGDATA=${RESTORE_PGDATA_DIR}
+  PGPORT=${RECOVER_PGPORT}
+
+  if [ $VERBOSE -eq 1 ]; then
+    echo "--> (recovery vars) :: PGDATABASE=${PGDATABASE}"
+    echo "--> (recovery vars) :: PGHOME=${PGHOME}"
+    echo "--> (recovery vars) :: PGDATA=${PGDATA}"
+    echo "--> (recovery vars) :: PGPORT=${PGPORT}"
+  fi
+
+  #
+  # analyze options
+  #
+
+  if [ ! -z "$TO_TAG" ]; then
+    NSR_UPPER_LIMIT_SAVETIME=$(mminfo -s $NSR_SERVER -oRt -r 'name,savetime(22)' -q "client=${NSR_CLIENT},${SAVEGROUP_QUERY}" 2>/dev/null | egrep -w "(PG_FULL_ARCH_${INSTANCENAME}_${TO_TAG}|PG_FULL_DATA_${INSTANCENAME}_${TO_TAG}|PG_FULL_TMAP_${INSTANCENAME}_${TO_TAG}|PG_ARCH_${INSTANCENAME}_${TO_TAG})" | tail -1 | sed 's/^[^ ]* //')
+    FULL_ARCH_SAVESET_INFO=$(mminfo -s $NSR_SERVER -oRt -r 'name,savetime(22)' -q "client=${NSR_CLIENT},${SAVEGROUP_QUERY},savetime<${NSR_UPPER_LIMIT_SAVETIME}" 2>/dev/null | grep PG_FULL_ARCH_${INSTANCENAME}_TAG | head -1)
+    FULL_ARCH_SAVETIME=$(echo $FULL_ARCH_SAVESET_INFO | sed 's/^[^ ]* //')
+    FULL_ARCH_SAVENAME=$(echo $FULL_ARCH_SAVESET_INFO | cut -d" " -f1)
+
+    TO_SAVESET_INFO=$(mminfo -s $NSR_SERVER -oRt -r 'name,savetime(22)' -q "client=${NSR_CLIENT},${SAVEGROUP_QUERY}" 2>/dev/null | egrep "(PG_FULL_ARCH_${INSTANCENAME}_${TO_TAG}|PG_ARCH_${INSTANCENAME}_${TO_TAG})" | head -1)
+    TO_SAVETIME=$(echo $TO_SAVESET_INFO | sed 's/^[^ ]* //')
+    TO_SAVENAME=$(echo $TO_SAVESET_INFO | cut -d" " -f1)
+
+    if [ "$FULL_ARCH_SAVENAME" == "" -o "$NSR_UPPER_LIMIT_SAVETIME" == "" ]; then
+      echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_ERROR} Cannot find a base (FULL_ARCH) WAL file archives backup for the specified tag $TO_TAG"
+      exit 1
+    fi
+    if [ "$TO_SAVENAME" == "" ]; then
+      echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_ERROR} Cannot find a WAL file archives backup for the specified tag $TO_TAG"
+      exit 1
+    fi
+  fi
+
+  if [ ! -z "$UNTIL_TIME" ]; then
+    NSR_UNTIL_TIME=$(date -d"${UNTIL_TIME}" +%m/%d/%Y" "%H:%M:%S)
+    FULL_ARCH_SAVESET_INFO=$(mminfo -s $NSR_SERVER -oRt -r 'name,savetime(22)' -q "client=${NSR_CLIENT},${SAVEGROUP_QUERY},savetime<=${NSR_UNTIL_TIME}" 2>/dev/null | grep PG_FULL_ARCH_${INSTANCENAME}_TAG | head -1)
+    FULL_ARCH_SAVETIME=$(echo $FULL_ARCH_SAVESET_INFO | sed 's/^[^ ]* //')
+    FULL_ARCH_SAVENAME=$(echo $FULL_ARCH_SAVESET_INFO | cut -d" " -f1)
+
+    TO_SAVESET_INFO=$(mminfo -s $NSR_SERVER -oRt -r 'name,savetime(22)' -q "client=${NSR_CLIENT},${SAVEGROUP_QUERY},savetime>${NSR_UNTIL_TIME}" 2>/dev/null | egrep "(PG_FULL_ARCH_${INSTANCENAME}_TAG|PG_ARCH_${INSTANCENAME}_TAG)" | tail -1)
+    TO_SAVETIME=$(echo $TO_SAVESET_INFO | sed 's/^[^ ]* //')
+    TO_SAVENAME=$(echo $TO_SAVESET_INFO | cut -d" " -f1)
+
+    if [ "$FULL_ARCH_SAVENAME" == "" ]; then
+      echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_ERROR} Cannot find a base (FULL_ARCH) WAL file archives backup for the specified --until-time $UNTIL_TIME"
+      exit 1
+    fi
+    if [ "$TO_SAVENAME" == "" ]; then
+      echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_ERROR} Cannot find a WAL file archives backup for the specified --until-time $UNTIL_TIME"
+      exit 1
+    fi
+  fi
+
+  if [ -z "$TO_TAG" ] && [ -z "$UNTIL_TIME" ]; then
+    echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} Recovering until the last WAL file archives backup since neither TO_TAG nor UNTIL_TIME was specified"
+    FULL_ARCH_SAVESET_INFO=$(mminfo -s $NSR_SERVER -oRt -r 'name,savetime(22)' -q "client=${NSR_CLIENT},${SAVEGROUP_QUERY}" 2>/dev/null | grep PG_FULL_ARCH_${INSTANCENAME}_TAG | head -1)
+    FULL_ARCH_SAVETIME=$(echo $FULL_ARCH_SAVESET_INFO | sed 's/^[^ ]* //')
+    FULL_ARCH_SAVENAME=$(echo $FULL_ARCH_SAVESET_INFO | cut -d" " -f1)
+
+    TO_SAVESET_INFO=$(mminfo -s $NSR_SERVER -oRt -r 'name,savetime(22)' -q "client=${NSR_CLIENT},${SAVEGROUP_QUERY}" 2>/dev/null | egrep "(PG_FULL_ARCH_${INSTANCENAME}_TAG|PG_ARCH_${INSTANCENAME}_TAG)" | head -1)
+    TO_SAVETIME=$(echo $TO_SAVESET_INFO | sed 's/^[^ ]* //')
+    TO_SAVENAME=$(echo $TO_SAVESET_INFO | cut -d" " -f1)
+
+    if [ "$FULL_ARCH_SAVENAME" == "" ]; then
+      echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_ERROR} Cannot find any base (FULL_ARCH) WAL file archives backup for the specified instance"
+      exit 1
+    fi
+    if [ "$TO_SAVENAME" == "" ]; then
+      echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_ERROR} Cannot find any recent WAL file archives backup for the specified instance"
+      exit 1
+    fi
+  fi
+
+  echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} Ready to restore all WAL archives from $FULL_ARCH_SAVENAME ($FULL_ARCH_SAVETIME) until $TO_SAVENAME ($TO_SAVETIME) save sets"
+
+  #
+  # restore and recover WAL file archives
+  #
+
+  SAVESETS_TO_RESTORE=$(mminfo -s $NSR_SERVER -oRt -r 'name' -q "client=${NSR_CLIENT},${SAVEGROUP_QUERY},savetime>=${FULL_ARCH_SAVETIME},savetime<=${TO_SAVETIME}" 2>/dev/null | egrep "(PG_FULL_ARCH_${INSTANCENAME}_TAG|PG_ARCH_${INSTANCENAME}_TAG)" | sed '1!G;h;$!d')
+
+  echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} The following save sets will be restored:"
+
+  for SAVESETNAME in ${SAVESETS_TO_RESTORE} ; do
+    echo "$SAVESETNAME"
+  done
+
+  rm -Rf $RESTORE_PGDATA_DIR/tablespace_map
+
+  #
+  # backup config files
+  #
+
+  echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} backing up postgresql.auto.conf and pg_hba.conf config files before recovery"
+
+  cp -p ${RESTORE_PGDATA_DIR}/postgresql.auto.conf ${RESTORE_PGDATA_DIR}/postgresql.auto.conf.before_recovery.$$ 2>/dev/null
+  cp -p ${RESTORE_PGDATA_DIR}/pg_hba.conf ${RESTORE_PGDATA_DIR}/pg_hba.conf.before_recovery.$$ 2>/dev/null
+
+  #
+  # adjust config files
+  #
+
+  echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} configuring postgresql.auto.conf and pg_hba.conf config files before recovery"
+
+  DB_RECOVERY_LOG_DIRECTORY=${RESTORE_PGDATA_DIR}/recover_log
+  DB_RECOVERY_LOG_FILE_PREFIX=recovery
+
+  mkdir -p ${DB_RECOVERY_LOG_DIRECTORY}
+
+  cat <<EOT > ${RESTORE_PGDATA_DIR}/postgresql.auto.conf
+cluster_name = '${RECOVER_CLUSTER_NAME}'
+port = ${RECOVER_PGPORT}
+listen_addresses = 'localhost'
+archive_mode = 'off'
+#archive_command = 'cp %p $RESTORE_ARCHIVE_DIR/%f'
+#wal_level = 'replica'
+client_min_messages = 'WARNING'
+log_checkpoints = 'on'
+log_connections = 'on'
+log_directory = '${DB_RECOVERY_LOG_DIRECTORY}'
+log_line_prefix = '%m [%p]: [%l-line] user=%u,db=%d,remote=%h,app=%a '
+log_min_messages = 'WARNING'
+logging_collector = 'on'
+EOT
+
+  
+  cat <<EOT > ${RESTORE_PGDATA_DIR}/pg_hba.conf
+# "local" is for Unix domain socket connections only
+local   all             all                                     trust
+# IPv4 local connections:
+host    all             all             127.0.0.1/32            trust
+EOT
+
+  for SAVESETNAME in ${SAVESETS_TO_RESTORE} ; do
+
+    echo "log_filename = '${DB_RECOVERY_LOG_FILE_PREFIX}-$(basename $SAVESETNAME).log'" >> ${RESTORE_PGDATA_DIR}/postgresql.auto.conf
+
+    mkdir -p $RESTORE_ARCHIVE_DIR
+    cd $RESTORE_ARCHIVE_DIR
+    ln -s $RESTORE_ARCHIVE_DIR $(basename $SAVESETNAME)
+
+    mkfifo $RESTORE_ARCHIVE_DIR/NSR_PG_PIPE
+
+    COMMAND="cat $RESTORE_ARCHIVE_DIR/NSR_PG_PIPE | tar --extract --dereference --ignore-zero --file - &"
+    echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} running $COMMAND"
+    eval $COMMAND
+
+    COMMAND="$RECOVER -f -d $RESTORE_ARCHIVE_DIR -a $SAVESETNAME/NSR_PG_PIPE -c $NSR_CLIENT"
+    echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} running $COMMAND"
+    eval $COMMAND
+
+    RC=$?
+
+    rm -f ${RESTORE_ARCHIVE_DIR}/$(basename $SAVESETNAME)
+    rm -f $RESTORE_ARCHIVE_DIR/NSR_PG_PIPE $RESTORE_ARCHIVE_DIR/.nsr
+
+    if [ $RC -ne 0 ]; then
+      echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_ERROR} error occured during recovery of $SAVESETNAME"
+      exit 1
+    fi
+
+    echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} Restored WAL file archives into $RESTORE_ARCHIVE_DIR"
+
+    echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} Create ${RESTORE_PGDATA_DIR}/recovery.conf file"
+
+    if [ -z "$UNTIL_TIME" ]; then
+      #RECOVERY_TARGET_TIME=$(date -d"${TO_SAVETIME}" +%Y-%m-%d" "%H:%M:%S)
+      RECOVERY_TARGET_LINE="#"
+    else
+      RECOVERY_TARGET_LINE="recovery_target_time = '$UNTIL_TIME'"
+    fi
+
+    if [ "$SAVESETNAME" == "$TO_SAVENAME" ]; then
+      cat <<EOT > ${RESTORE_PGDATA_DIR}/recovery.conf
+restore_command = 'cp $RESTORE_ARCHIVE_DIR/%f %p'
+recovery_target_action = shutdown
+recovery_target_inclusive = true
+$RECOVERY_TARGET_LINE
+standby_mode = 'on'
+EOT
+    else
+      cat <<EOT > ${RESTORE_PGDATA_DIR}/recovery.conf
+restore_command = 'cp $RESTORE_ARCHIVE_DIR/%f %p'
+recovery_target_action = shutdown
+recovery_target_inclusive = true
+$RECOVERY_TARGET_LINE
+standby_mode = 'on'
+EOT
+    fi
+
+    echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} Starting PostgreSQL cluster recovery..."
+
+    $PGHOME/bin/pg_ctl start -D $RESTORE_PGDATA_DIR
+
+    RC=$?
+
+    if [ $RC -ne 0 ]; then
+      echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_ERROR} error occured during starting up a PostgreSQL instance"
+      echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_ERROR} Log file ${DB_RECOVERY_LOG_DIRECTORY}/${DB_RECOVERY_LOG_FILE_PREFIX}-$(basename $SAVESETNAME).log"
+      exit 1
+    fi
+
+    sleep 5
+    if [ "$SAVESETNAME" == "$TO_SAVENAME" ] && [ ! -z "$UNTIL_TIME" ]; then
+      while [ $(grep "shutdown at recovery target" ${DB_RECOVERY_LOG_DIRECTORY}/${DB_RECOVERY_LOG_FILE_PREFIX}-$(basename $SAVESETNAME).log | wc -l) -eq 0 ]; do
+        echo -n "."
+        sleep 5
+      done
+    else
+      while [ $(tail -1 ${DB_RECOVERY_LOG_DIRECTORY}/${DB_RECOVERY_LOG_FILE_PREFIX}-$(basename $SAVESETNAME).log | grep "cp: cannot stat" | wc -l) -eq 0 ]; do
+        echo -n "."
+        sleep 5
+      done
+      $PGHOME/bin/pg_ctl stop -D $RESTORE_PGDATA_DIR
+    fi
+
+    echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} Recover task completed."
+    echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} Log file ${DB_RECOVERY_LOG_DIRECTORY}/${DB_RECOVERY_LOG_FILE_PREFIX}-$(basename $SAVESETNAME).log"
+
+    # delete restored WAL file archives to release space
+    #
+#    rm -f $RESTORE_ARCHIVE_DIR/* 2>/dev/null
+    cd $RESTORE_ARCHIVE_DIR
+    ls -tp | grep -v '/$' | tail -n +2 | xargs -d '\n' -r rm -- 2>/dev/null
+
+  done
+
+  mv ${RESTORE_PGDATA_DIR}/recovery.conf ${RESTORE_PGDATA_DIR}/recovery.last 2>/dev/null
+
+  #
+  # restore config files
+  #
+
+  echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} restoring original postgresql.auto.conf and pg_hba.conf config files after recovery"
+
+  mv ${RESTORE_PGDATA_DIR}/postgresql.auto.conf ${DB_RECOVERY_LOG_DIRECTORY}/postgresql.auto.conf.recovery 2>/dev/null
+  mv ${RESTORE_PGDATA_DIR}/pg_hba.conf ${DB_RECOVERY_LOG_DIRECTORY}/pg_hba.conf.recovery 2>/dev/null
+
+  cp -p ${RESTORE_PGDATA_DIR}/postgresql.auto.conf.before_recovery.$$ ${RESTORE_PGDATA_DIR}/postgresql.auto.conf 2>/dev/null
+  cp -p ${RESTORE_PGDATA_DIR}/pg_hba.conf.before_recovery.$$ ${RESTORE_PGDATA_DIR}/pg_hba.conf 2>/dev/null 2>/dev/null
+
+  echo
+  echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} Recovered the instance"
+  echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} Log files in ${RESTORE_PGDATA_DIR}/recover_log directory"
+
+fi
+
+echo
+echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} $SCRIPT completed at $(date +%Y-%m-%d_%H:%M:%S)"
+echo
+
+exit 0
+

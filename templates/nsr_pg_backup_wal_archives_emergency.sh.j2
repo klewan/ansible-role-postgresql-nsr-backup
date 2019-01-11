@@ -1,0 +1,231 @@
+#!/bin/sh
+# File: pg_nsr_backup_wal_archives_emergency.sh
+#
+# This script triggers WAL file archives backup when archive filesystem threshold is exceeded
+#
+# History:
+#
+# Date       Author       Comments
+# ---------- ------------ ----------------------------------------------
+# 25/10/2018 KLewandowski Created
+# ----------------------------------------------------------------------
+#
+
+
+#
+# Variables
+#
+
+PGTAB=/etc/pgtab
+BASE_PATH=/usr/lib64/qt-3.3/bin:/usr/local/bin:/bin:/usr/bin:/usr/local/sbin:/usr/sbin:$PATH:$HOME/.local/bin:$HOME/bin
+DIR=$(dirname $0)
+SCRIPT="$(basename $0 .sh)"
+ECHO_INFO="INFO> "
+ECHO_ERROR="ERROR> "
+VERBOSE=0
+BACKUP_ARGUMENTS=""
+ARCHIVE_DIR_PREFIX={{ postgresql_nsr_backup_default_archive_dir_prefix }}
+THRESHOLD={{ postgresql_nsr_backup_default_arch_usage_perc_threshold }}
+
+if [ "$DIR" == "." ]; then
+  DIR=$(pwd)
+fi
+
+#
+# Functions
+#
+
+function usage()
+{
+  cat <<EOT
+
+Trigger WAL file archives backup when archive filesystem threshold is exceeded
+
+Usage:
+  $0 [OPTION]...
+
+Options:
+   -h, --help                    show this help, then exit (optional)
+   -v, --verbose                 verbose mode (optional)
+   -t, --threshold               filesystem usage threshold (%) that triggers backup job (optional) [default: ${THRESHOLD}]
+   -g, --savegroup=SAVEGROUP     NetWorker save group to denote the group of the save
+   -r, --retention=RETENTION     backup retention for NetWorker save sets (optional)
+   -d, --backup-dir-prefix=DIRECTORY
+                                 backup directory base, i.e. parent directory (optional)
+                                 DIRECTORY/INSTANCENAME is where backups will be saved
+   -L, --log-dir=DIRECTORY       send session log to this directory (optional)
+   -a, --archive-dir=DIRECTORY   location of archived WAL file segments (optional)
+   -A, --archive-dir-prefix=DIRECTORY
+                                 parent directory of archived WAL files;
+                                 DIRECTORY/INSTANCENAME is expected to contain archived WAL files (optional)
+
+EOT
+}
+
+
+#
+# args parsing
+#
+
+while (( "$#" )); do
+  case "$1" in
+    -g)
+      SAVEGROUP=$2
+      shift 2
+      BACKUP_ARGUMENTS="$BACKUP_ARGUMENTS --savegroup=$SAVEGROUP"
+      ;;
+    --savegroup=*)
+      SAVEGROUP="${1#*=}"
+      shift
+      BACKUP_ARGUMENTS="$BACKUP_ARGUMENTS --savegroup=$SAVEGROUP"
+      ;;
+    -t)
+      THRESHOLD=$2
+      shift 2
+      ;;
+    --threshold=*)
+      THRESHOLD="${1#*=}"
+      shift
+      ;;
+    -r)
+      BACKUP_RETENTION=$2
+      shift 2
+      BACKUP_ARGUMENTS="$BACKUP_ARGUMENTS --retention=$BACKUP_RETENTION"
+      ;;
+    --retention=*)
+      BACKUP_RETENTION="${1#*=}"
+      shift
+      BACKUP_ARGUMENTS="$BACKUP_ARGUMENTS --retention=$BACKUP_RETENTION"
+      ;;
+    -d)
+      BACKUP_DIR_PREFIX=$2
+      shift 2
+      BACKUP_ARGUMENTS="$BACKUP_ARGUMENTS --backup-dir-prefix=$BACKUP_DIR_PREFIX"
+      ;;
+    --backup-dir-prefix=*)
+      BACKUP_DIR_PREFIX="${1#*=}"
+      shift
+      BACKUP_ARGUMENTS="$BACKUP_ARGUMENTS --backup-dir-prefix=$BACKUP_DIR_PREFIX"
+      ;;
+    -a)
+      ARCHIVE_DIR=$2
+      shift 2
+      BACKUP_ARGUMENTS="$BACKUP_ARGUMENTS --archive-dir=$ARCHIVE_DIR"
+      ;;
+    --archive-dir=*)
+      ARCHIVE_DIR="${1#*=}"
+      shift
+      BACKUP_ARGUMENTS="$BACKUP_ARGUMENTS --archive-dir=$ARCHIVE_DIR"
+      ;;
+    -A)
+      ARCHIVE_DIR_PREFIX=$2
+      shift 2
+      BACKUP_ARGUMENTS="$BACKUP_ARGUMENTS --archive-dir-prefix=$ARCHIVE_DIR_PREFIX"
+      ;;
+    --archive-dir-prefix=*)
+      ARCHIVE_DIR_PREFIX="${1#*=}"
+      shift
+      BACKUP_ARGUMENTS="$BACKUP_ARGUMENTS --archive-dir-prefix=$ARCHIVE_DIR_PREFIX"
+      ;;
+    -L)
+      LOG_DIR=$2
+      shift 2
+      BACKUP_ARGUMENTS="$BACKUP_ARGUMENTS --log-dir=$LOG_DIR"
+      ;;
+    --log-dir=*)
+      LOG_DIR="${1#*=}"
+      shift
+      BACKUP_ARGUMENTS="$BACKUP_ARGUMENTS --log-dir=$LOG_DIR"
+      ;;
+    -v|--verbose)
+      VERBOSE=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      shift
+      exit 0
+      ;;
+    -*|--*=) # unsupported flags
+      echo "ERROR: Unsupported flag $1" >&2
+      usage
+      exit 1
+      ;;
+    *)
+      echo "ERROR: Unknown parameter $1" >&2
+      usage
+      exit 1
+      ;;
+  esac
+done
+
+
+#
+# The real stuff starts here
+#
+
+if [ -z "$BACKUP_ARGUMENTS" ]; then
+  BACKUP_ARGUMENTS="$BACKUP_ARGUMENTS --archive-dir-prefix=$ARCHIVE_DIR_PREFIX"
+fi
+
+echo
+echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} $SCRIPT started at $(date +%Y-%m-%d_%H:%M:%S)"
+echo
+
+if [ $VERBOSE -eq 1 ]; then
+  echo "--> (PARAMETERS) :: BACKUP_RETENTION: $BACKUP_RETENTION"
+  echo "--> (PARAMETERS) :: SAVEGROUP: $SAVEGROUP"
+  echo "--> (PARAMETERS) :: BACKUP_DIR_PREFIX: $BACKUP_DIR_PREFIX"
+  echo "--> (PARAMETERS) :: LOG_DIR: $LOG_DIR"
+  echo "--> (PARAMETERS) :: ARCHIVE_DIR: $ARCHIVE_DIR"
+  echo "--> (PARAMETERS) :: ARCHIVE_DIR_PREFIX: $ARCHIVE_DIR_PREFIX"
+  echo
+fi
+
+if [ $VERBOSE -eq 1 ]; then
+  echo "--> (var) BACKUP_ARGUMENTS: $BACKUP_ARGUMENTS"
+  echo
+fi
+
+if [ ! -z "$ARCHIVE_DIR" ]; then
+  FILESYSTEM=$ARCHIVE_DIR
+else
+  FILESYSTEM=$ARCHIVE_DIR_PREFIX
+fi
+
+for line in $(awk ' $1!~ /[#*]/ {print $1} ' $PGTAB | sed '/^$/d' | cut -d: -f1,2,3,4 | grep -v ':dummy')
+do
+  if [ -n "$line" ]; then
+    export PGDATABASE=`echo $line |cut -d: -f1`
+    export PGHOME=`echo $line |cut -d: -f2`
+    export PATH=$BASE_PATH:${PGHOME}/bin
+
+    ARCH_USAGE=$(df -k ${FILESYSTEM} | tail -1 | awk '{print $5}' | sed 's/\%//')
+
+    # check if max usage threshold is exceeded
+    if [ $ARCH_USAGE -ge $THRESHOLD ]; then
+
+      # check the number of currently running archivelog backup jobs
+      CURRENTLY_RUNNING=$(ps -eaf | grep -w nsr_pg_backup.sh | grep -w ARCH | grep -v grep | wc -l)
+      if [ $CURRENTLY_RUNNING -ge 1 ]
+      then
+        echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} Number of currently running archivelog backup jobs: ${CURRENTLY_RUNNING}. Will not start another one."
+      else
+        echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} $FILESYSTEM usage ${ARCH_USAGE}% exceeded a defined threshold ${THRESHOLD}%. Starting backup .."
+
+        COMMAND="$DIR/nsr_pg_backup.sh --instance=$PGDATABASE --verbose --backup-type=ARCH $BACKUP_ARGUMENTS"
+        echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} running $COMMAND"
+        eval $COMMAND
+      fi
+
+    fi
+
+  fi
+done
+
+echo
+echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} $SCRIPT completed at $(date +%Y-%m-%d_%H:%M:%S)"
+echo
+
+exit 0
+

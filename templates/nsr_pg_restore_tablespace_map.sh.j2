@@ -1,0 +1,273 @@
+#!/bin/sh
+# File: pg_nsr_restore_tablespace_map.sh
+#
+# Restore tablespace_map file for the specified PostgreSQL cluster
+#
+# History:
+#
+# Date       Author       Comments
+# ---------- ------------ ----------------------------------------------
+# 25/10/2018 KLewandowski Created
+# ----------------------------------------------------------------------
+#
+
+
+#
+# Variables
+#
+
+DIR=$(dirname $0)
+SCRIPT="$(basename $0 .sh)"
+CURRENT_TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+NSR_SERVER=$(awk ' $1!~ /[#*]/ {print $1} ' /nsr/res/servers 2>/dev/null| head -1)
+NSR_CLIENT="$(hostname -s)-nsr.$(echo $NSR_SERVER | awk -F. '{$1="";OFS="." ; print $0}' | sed 's/^.//')"
+VERBOSE=0
+ECHO_INFO="INFO> "
+ECHO_ERROR="ERROR> "
+RECOVER=$(which recover)
+
+#
+# Parameters (default values)
+#
+
+#
+# Functions
+#
+
+function usage()
+{
+  cat <<EOT
+
+Restore tablespace_map file for the specified PostgreSQL cluster
+
+Usage:
+  $0 [OPTION]...
+
+Options:
+   -h, --help                    show this help, then exit (optional)
+   -v, --verbose                 verbose mode (optional)
+   -i, --instance=INSTANCENAME   run restore for this PostgreSQL instance (mandatory)
+   -g, --savegroup=SAVEGROUP     run restore for this NetWorker save group (optional)
+   -c, --backup-client=CLIENT    name of the machine that saved the files (optional) [default: $(hostname -s)]
+   -t, --tag=TAG                 restore from this TAG (TAG<date>T<time>) (optional)
+   -r, --recovery-target-time=TIME
+                                 TIME specifies a time as an upper limit (optional) [default: last backup time]
+                                 restore tablespace_map file that can be used to restore and recover up to 
+                                 but not including the specified time
+                                   e.g.: "2018-10-26 15:30:00"
+   -d, --restore-dir=DIRECTORY   the destination directory to relocate recovered files (optional) [default: original location]
+   -L, --log-dir=DIRECTORY       send session log to this directory (optional)
+
+EOT
+}
+
+
+#
+# args parsing
+#
+
+while (( "$#" )); do
+  case "$1" in
+    -i)
+      INSTANCENAME=$2
+      shift 2
+      ;;
+    --instance=*)
+      INSTANCENAME="${1#*=}"
+      shift
+      ;;
+    -d)
+      RESTORE_DIR=$2
+      shift 2
+      ;;
+    --restore-dir=*)
+      RESTORE_DIR="${1#*=}"
+      shift
+      ;;
+    -c)
+      BACKUP_CLIENT=$2
+      shift 2
+      ;;
+    --backup-client=*)
+      BACKUP_CLIENT="${1#*=}"
+      shift
+      ;;
+    -g)
+      SAVEGROUP=$2
+      shift 2
+      ;;
+    --savegroup=*)
+      SAVEGROUP="${1#*=}"
+      shift
+      ;;
+    -t)
+      TAG=$2
+      shift 2
+      ;;
+    --tag=*)
+      TAG="${1#*=}"
+      shift
+      ;;
+    -r)
+      RECOVERY_TARGET_TIME=$2
+      shift 2
+      ;;
+    --recovery-target-time=*)
+      RECOVERY_TARGET_TIME="${1#*=}"
+      shift
+      ;;
+    -L)
+      LOG_DIR=$2
+      shift 2
+      ;;
+    --log-dir=*)
+      LOG_DIR="${1#*=}"
+      shift
+      ;;
+    -v|--verbose)
+      VERBOSE=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      shift
+      exit 0
+      ;;
+    -*|--*=) # unsupported flags
+      echo "ERROR: Unsupported flag $1" >&2
+      usage
+      exit 1
+      ;;
+    *)
+      echo "ERROR: Unknown parameter $1" >&2
+      usage
+      exit 1
+      ;;
+  esac
+done
+
+if [ -z "$BACKUP_CLIENT" ]; then
+  BACKUP_CLIENT=$(hostname -s)
+fi
+
+NSR_CLIENT="${BACKUP_CLIENT}-nsr.$(echo $NSR_SERVER | awk -F. '{$1="";OFS="." ; print $0}' | sed 's/^.//')"
+
+if [ -z "$INSTANCENAME" ]; then
+  echo "${ECHO_ERROR}: Mandatory parameter '--instance=INSTANCENAME' not provided"
+  usage
+  exit 1
+fi
+
+if [ ! -z "$LOG_DIR" ]; then
+  echo "Logfile -> $LOG_DIR/${SCRIPT}.${INSTANCENAME}.${CURRENT_TIMESTAMP}"
+  exec 1>>$LOG_DIR/${SCRIPT}.${INSTANCENAME}.${CURRENT_TIMESTAMP} 2>&1
+fi
+
+if [ -z "$SAVEGROUP" ]; then
+  SAVEGROUP="{{ postgresql_nsr_backup_default_savegroup_prefix }}_${INSTANCENAME}_${BACKUP_CLIENT}_dbfull"
+fi
+
+if [ ! -z "$TAG" ]; then
+  unset RECOVERY_TARGET_TIME
+fi
+
+#
+# The real stuff starts here
+#
+
+echo
+echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} $SCRIPT started at $(date +%Y-%m-%d_%H:%M:%S)"
+echo
+
+if [ $VERBOSE -eq 1 ]; then
+  echo "--> (PARAMETERS) :: INSTANCENAME:         $INSTANCENAME"
+  echo "--> (PARAMETERS) :: SAVEGROUP:            $SAVEGROUP"
+  echo "--> (PARAMETERS) :: TAG:                  $TAG"
+  echo "--> (PARAMETERS) :: RECOVERY_TARGET_TIME: $RECOVERY_TARGET_TIME"
+  echo "--> (PARAMETERS) :: RESTORE_DIR:          $RESTORE_DIR"
+  echo "--> (PARAMETERS) :: LOG_DIR:              $LOG_DIR"
+
+  echo
+fi
+
+if [ $VERBOSE -eq 1 ]; then
+  echo "--> (NSR) :: NSR_SERVER:  $NSR_SERVER"
+  echo "--> (NSR) :: NSR_CLIENT:  $NSR_CLIENT"
+  echo
+fi
+
+#
+# find save set name
+#
+
+if [ ! -z "$TAG" ]; then
+  
+  SAVESETNAME=$(mminfo -s $NSR_SERVER -oRt -r 'name' -q "client=${NSR_CLIENT},group=${SAVEGROUP}" 2>/dev/null | grep PG_FULL_TMAP_${INSTANCENAME}_${TAG} | head -1)
+
+  if [ "$SAVESETNAME" != "" ]; then
+    echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} Found $SAVESETNAME save set for the specified tag $TAG"
+  else
+    echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_ERROR} Cannot find a backup for the specified tag $TAG"
+    exit 1
+  fi
+
+else
+
+  if [ -z "$RECOVERY_TARGET_TIME" ]; then
+    echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} Recovering from the last backup since neither TAG nor RECOVERY_TARGET_TIME was specified"
+    SAVESETNAME=$(mminfo -s $NSR_SERVER -oRt -r 'name' -q "client=${NSR_CLIENT},group=${SAVEGROUP}" 2>/dev/null | grep PG_FULL_TMAP_${INSTANCENAME}_TAG | head -1)
+  else
+    NSR_RECOVERY_TARGET_TIME=$(date -d"${RECOVERY_TARGET_TIME}" +%m/%d/%Y" "%H:%M:%S)
+    SAVESETNAME=$(mminfo -s $NSR_SERVER -oRt -r 'name' -q "client=${NSR_CLIENT},group=${SAVEGROUP},savetime<=${NSR_RECOVERY_TARGET_TIME}" 2>/dev/null | grep PG_FULL_TMAP_${INSTANCENAME}_TAG | head -1)
+  fi
+
+  if [ "$SAVESETNAME" != "" ]; then
+    echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} Found $SAVESETNAME save set for the specified recovery target time $RECOVERY_TARGET_TIME"
+  else
+    echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_ERROR} Cannot find a backup for the specified recovery target time $RECOVERY_TARGET_TIME"
+    exit 1
+  fi
+
+fi
+
+#
+# restore tablespace_map file
+#
+
+if [ -z "$RESTORE_DIR" ]; then
+  mkdir -p $SAVESETNAME
+  COMMAND="$RECOVER -f -a $SAVESETNAME -c $NSR_CLIENT"
+else
+  mkdir -p $RESTORE_DIR
+  cd $RESTORE_DIR
+  ln -s $RESTORE_DIR $(basename $SAVESETNAME)
+  COMMAND="$RECOVER -f -d $RESTORE_DIR -a $SAVESETNAME -c $NSR_CLIENT"
+fi
+
+echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} running $COMMAND"
+eval $COMMAND
+
+RC=$?
+
+if [ ! -z "$RESTORE_DIR" ]; then
+  rm -f ${RESTORE_DIR}/$(basename $SAVESETNAME)
+fi
+
+if [ $RC -ne 0 ]; then
+  echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_ERROR} error occured during recovery of $SAVESETNAME"
+  exit 1 
+fi
+
+echo
+if [ -z "$RESTORE_DIR" ]; then
+  echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} Restored into $SAVESETNAME"
+else
+  echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} Restored into $RESTORE_DIR"
+fi
+
+echo
+echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} $SCRIPT completed at $(date +%Y-%m-%d_%H:%M:%S)"
+echo
+
+exit 0
+

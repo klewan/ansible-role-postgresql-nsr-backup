@@ -1,0 +1,523 @@
+#!/bin/sh
+# File: pg_nsr_backup.sh
+#
+# Back up PostgreSQL cluster to EMC NetWorker using a named pipe
+#
+# History:
+#
+# Date       Author       Comments
+# ---------- ------------ ----------------------------------------------
+# 25/10/2018 KLewandowski Created
+# ----------------------------------------------------------------------
+#
+
+
+#
+# Variables
+#
+
+PGTAB=/etc/pgtab
+BASE_PATH=/usr/lib64/qt-3.3/bin:/usr/local/bin:/bin:/usr/bin:/usr/local/sbin:/usr/sbin:$PATH:$HOME/.local/bin:$HOME/bin
+
+DIR=$(dirname $0)
+SCRIPT="$(basename $0 .sh)"
+CURRENT_TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+BACKUP_TAG="$(date +TAG%Y%m%dT%H%M%S)"
+TAR=$(which tar)
+SAVE=$(which save)
+NSR_SERVER=$(awk ' $1!~ /[#*]/ {print $1} ' /nsr/res/servers 2>/dev/null| head -1)
+NSR_CLIENT="$(hostname -s)-nsr.$(echo $NSR_SERVER | awk -F. '{$1="";OFS="." ; print $0}' | sed 's/^.//')"
+PIPE_NAME="NSR_PG_PIPE"
+
+#
+# Parameters (default values)
+#
+VERBOSE=0
+BACKUP_DIR_PREFIX={{ postgresql_nsr_backup_default_backup_dir_prefix }}
+ARCHIVE_DIR_PREFIX={{ postgresql_nsr_backup_default_archive_dir_prefix }}
+BACKUP_ROLE={{ postgresql_nsr_backup_default_backup_role }}
+DATABASE_SERVER_HOSTNAME=$(hostname --fqdn)
+BACKUP_TYPE=FULL
+BACKUP_RETENTION="{{ postgresql_nsr_backup_default_backup_retention }}"
+DEFAULT_SAVEGROUP="{{ postgresql_nsr_backup_default_savegroup_prefix }}_INSTANCENAME_$(hostname -s)_db$(echo $BACKUP_TYPE | tr '[:upper:]' '[:lower:]')"
+ECHO_INFO="INFO> "
+ECHO_ERROR="ERROR> "
+
+#
+# Functions
+#
+
+function usage()
+{
+  cat <<EOT
+
+Back up PostgreSQL cluster to EMC NetWorker using a named pipe
+
+Usage:
+  $0 [OPTION]...
+
+Options:
+   -h, --help                    show this help, then exit (optional)
+   -v, --verbose                 verbose mode (optional)
+   -i, --instance=INSTANCENAME   PostgreSQL instance to backup (mandatory)
+   -t, --backup-type=BACKUPTYPE  backup type (FULL|ARCH) (optional) [default: $BACKUP_TYPE]
+   -r, --retention=RETENTION     backup retention for NetWorker save sets (optional) [default: NetWorker setting for a savegroup]
+   -g, --savegroup=SAVEGROUP     NetWorker save group to denote the group of the save [default: $DEFAULT_SAVEGROUP]
+   -d, --backup-dir-prefix=DIRECTORY    
+                                 backup directory base, i.e. parent directory (optional) [default: $BACKUP_DIR_PREFIX]
+                                 DIRECTORY/INSTANCENAME is where backups will be saved
+   -L, --log-dir=DIRECTORY       send session log to this directory (optional)
+   -U, --username=USERNAME       database user name used for a backup session (optional) [default: $BACKUP_ROLE]
+   -H, --host=HOSTNAME           database server host used for a backup session (optional) [default: $DATABASE_SERVER_HOSTNAME]
+   -a, --archive-dir=DIRECTORY   location of archived WAL file segments (optional)
+   -A, --archive-dir-prefix=DIRECTORY   
+                                 parent directory of archived WAL files; 
+                                 DIRECTORY/INSTANCENAME is expected to contain archived WAL files (optional) [default: $ARCHIVE_DIR_PREFIX]
+
+EOT
+}
+
+
+#
+# The real stuff starts here
+#
+
+#
+# args parsing
+#
+
+while (( "$#" )); do
+  case "$1" in
+    -i)
+      INSTANCENAME=$2
+      shift 2
+      ;;
+    --instance=*)
+      INSTANCENAME="${1#*=}"
+      shift
+      ;;
+    -d)
+      BACKUP_DIR_PREFIX=$2
+      shift 2
+      ;;
+    --backup-dir-prefix=*)
+      BACKUP_DIR_PREFIX="${1#*=}"
+      shift
+      ;;
+    -a)
+      ARCHIVE_DIR=$2
+      shift 2
+      ;;
+    --archive-dir=*)
+      ARCHIVE_DIR="${1#*=}"
+      shift
+      ;;
+    -A)
+      ARCHIVE_DIR_PREFIX=$2
+      shift 2
+      ;;
+    --archive-dir-prefix=*)
+      ARCHIVE_DIR_PREFIX="${1#*=}"
+      shift
+      ;;
+    -t)
+      BACKUP_TYPE=$2
+      shift 2
+      ;;
+    --backup-type=*)
+      BACKUP_TYPE="${1#*=}"
+      shift
+      ;;
+    -r)
+      BACKUP_RETENTION=$2
+      shift 2
+      ;;
+    --retention=*)
+      BACKUP_RETENTION="${1#*=}"
+      shift
+      ;;
+    -g)
+      SAVEGROUP=$2
+      shift 2
+      ;;
+    --savegroup=*)
+      SAVEGROUP="${1#*=}"
+      shift
+      ;;
+    -L)
+      LOG_DIR=$2
+      shift 2
+      ;;
+    --log-dir=*)
+      LOG_DIR="${1#*=}"
+      shift
+      ;;
+    -U)
+      BACKUP_ROLE=$2
+      shift 2
+      ;;
+    --username=*)
+      BACKUP_ROLE="${1#*=}"
+      shift
+      ;;
+    -H)
+      DATABASE_SERVER_HOSTNAME=$2
+      shift 2
+      ;;
+    --host=*)
+      DATABASE_SERVER_HOSTNAME="${1#*=}"
+      shift
+      ;;
+    -v|--verbose)
+      VERBOSE=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      shift
+      exit 0
+      ;;
+    -*|--*=) # unsupported flags
+      echo "ERROR: Unsupported flag $1" >&2
+      usage
+      exit 1
+      ;;
+    *)
+      echo "ERROR: Unknown parameter $1" >&2
+      usage
+      exit 1
+      ;;
+  esac
+done
+
+echo
+echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} $SCRIPT started at $(date +%Y-%m-%d_%H:%M:%S)"
+
+if [ -z "$INSTANCENAME" ]; then
+  echo "ERROR: Mandatory parameter '--instance=INSTANCENAME' not provided"
+  usage
+  exit 1
+fi
+
+if [ ! -z "$LOG_DIR" ]; then
+  echo "Logfile -> $LOG_DIR/${SCRIPT}.${BACKUP_TYPE}.${INSTANCENAME}.${CURRENT_TIMESTAMP}" 
+  exec 1>>$LOG_DIR/${SCRIPT}.${BACKUP_TYPE}.${INSTANCENAME}.${CURRENT_TIMESTAMP} 2>&1
+fi
+
+if [ -z "$SAVEGROUP" ]; then
+  SAVEGROUP="{{ postgresql_nsr_backup_default_savegroup_prefix }}_${INSTANCENAME}_$(hostname -s)_db$(echo $BACKUP_TYPE | tr '[:upper:]' '[:lower:]')"
+fi
+
+if [ $VERBOSE -eq 1 ]; then
+  echo "--> (PARAMETERS) :: INSTANCENAME: $INSTANCENAME"
+  echo "--> (PARAMETERS) :: BACKUP_TYPE: $BACKUP_TYPE"
+  echo "--> (PARAMETERS) :: BACKUP_RETENTION: $BACKUP_RETENTION"
+  echo "--> (PARAMETERS) :: SAVEGROUP: $SAVEGROUP"
+  echo "--> (PARAMETERS) :: BACKUP_DIR_PREFIX: $BACKUP_DIR_PREFIX"
+  echo "--> (PARAMETERS) :: LOG_DIR: $LOG_DIR"
+  echo "--> (PARAMETERS) :: ARCHIVE_DIR: $ARCHIVE_DIR"
+  echo "--> (PARAMETERS) :: ARCHIVE_DIR_PREFIX: $ARCHIVE_DIR_PREFIX"
+  echo "--> (PARAMETERS) :: BACKUP_ROLE: $BACKUP_ROLE"
+  echo "--> (PARAMETERS) :: DATABASE_SERVER_HOSTNAME: $DATABASE_SERVER_HOSTNAME"
+fi
+
+if [ -z "$ARCHIVE_DIR" ]; then
+  ARCHIVE_DIR="${ARCHIVE_DIR_PREFIX}/${INSTANCENAME}"
+fi
+
+if [ -z "$BACKUP_RETENTION" ]; then
+  RETENTION_ARGS=""
+else
+  RETENTION_ARGS=" -w ${BACKUP_RETENTION} -y ${BACKUP_RETENTION}" 
+fi
+
+#
+# read pgtab file
+#
+
+PGTABENTRY=$(awk ' $1!~ /[#*]/ {print $1} ' $PGTAB | sed '/^$/d' | cut -d: -f1,2,3,4 | grep -v ':dummy' | grep -w $INSTANCENAME | tail -1)
+if [ -n "$PGTABENTRY" ]; then
+  export PGDATABASE=`echo $PGTABENTRY |cut -d: -f1`
+  export PGHOME=`echo $PGTABENTRY |cut -d: -f2`
+  export PATH=$BASE_PATH:${PGHOME}/bin
+  export PGDATA=`echo $PGTABENTRY |cut -d: -f3`
+  export PGPORT=`echo $PGTABENTRY |cut -d: -f4`
+else
+  echo "ERROR: Cannot find an entry for $INSTANCENAME instance in $PGTAB file"
+  exit 1
+fi
+
+if [ $VERBOSE -eq 1 ]; then
+  echo "--> ($PGTAB) :: PGDATABASE=$PGDATABASE"
+  echo "--> ($PGTAB) :: PGHOME=$PGHOME"
+  echo "--> ($PGTAB) :: PGDATA=$PGDATA"
+  echo "--> ($PGTAB) :: PGPORT=$PGPORT"
+fi
+
+if [ $VERBOSE -eq 1 ]; then
+  echo "--> (NSR) :: NSR_SERVER=$NSR_SERVER"
+  echo "--> (NSR) :: NSR_CLIENT=$NSR_CLIENT"
+fi
+
+if [ $VERBOSE -eq 1 ]; then
+  echo "--> (var) :: BACKUP_TAG=$BACKUP_TAG"
+  echo "--> (var) :: PATH=$PATH"
+  echo "--> (var) :: DIR=$DIR"
+  echo "--> (var) :: SCRIPT=$SCRIPT"
+  echo "--> (var) :: TAR=$TAR"
+  echo "--> (var) :: SAVE=$SAVE"
+  echo "--> (var) :: PIPE_NAME=$PIPE_NAME"
+fi
+
+
+#
+# Preparation
+#
+
+BACKUP_DIR_FULL_DATA="${BACKUP_DIR_PREFIX}/PG_FULL_DATA_${INSTANCENAME}_${BACKUP_TAG}"
+BACKUP_DIR_FULL_ARCH="${BACKUP_DIR_PREFIX}/PG_FULL_ARCH_${INSTANCENAME}_${BACKUP_TAG}"
+BACKUP_DIR_FULL_TBSMAP="${BACKUP_DIR_PREFIX}/PG_FULL_TMAP_${INSTANCENAME}_${BACKUP_TAG}"
+BACKUP_DIR_ARCH="${BACKUP_DIR_PREFIX}/PG_ARCH_${INSTANCENAME}_${BACKUP_TAG}"
+
+rm -Rf $BACKUP_DIR_FULL_DATA $BACKUP_DIR_FULL_ARCH $BACKUP_DIR_ARCH
+
+if [ $VERBOSE -eq 1 ]; then
+  echo "--> (backup dir) :: BACKUP_DIR_FULL_DATA=$BACKUP_DIR_FULL_DATA"
+  echo "--> (backup dir) :: BACKUP_DIR_FULL_ARCH=$BACKUP_DIR_FULL_ARCH"
+  echo "--> (backup dir) :: BACKUP_DIR_ARCH=$BACKUP_DIR_ARCH"
+fi
+
+
+#
+# Backup
+#
+
+echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} running ${BACKUP_TYPE} backup" 
+
+if [ "$BACKUP_TYPE" == "FULL" ]; then
+
+  #IN_RECOVERY=$($PGHOME/bin/psql -X -t -h $DATABASE_SERVER_HOSTNAME -p $PGPORT -U $BACKUP_ROLE -c 'select pg_is_in_recovery()' | egrep '(f|t)' | sed 's/ //g') 
+  CLUSTER_STATE=$($PGHOME/bin/pg_controldata | grep -i "Database cluster state" | cut -d: -f2 | sed 's/^ *//')
+
+  # if [ "$IN_RECOVERY" != "f" ]; then
+  if [ ! "$CLUSTER_STATE" == "in production" ]; then
+    echo
+    echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} This PostgreSQL cluster is not 'in production' state. Skipping backup.."
+    echo
+    echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} $SCRIPT completed at $(date +%Y-%m-%d_%H:%M:%S)"
+    echo
+    exit 0
+  fi
+
+  #
+  # Start instance backup
+  #
+
+  # COMMAND="$PGHOME/bin/psql -X -h $DATABASE_SERVER_HOSTNAME -p $PGPORT -U $BACKUP_ROLE -c \"SELECT pg_start_backup('$BACKUP_TAG')\" postgres"
+  COMMAND="$PGHOME/bin/psql -X -U $BACKUP_ROLE -c \"SELECT pg_start_backup('$BACKUP_TAG')\" postgres"
+  echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} running $COMMAND"
+  eval $COMMAND
+
+  RC=$?
+
+  if [ $RC -ne 0 ]; then
+    echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_ERROR} error occured while calling pg_start_backup() function"
+    exit 1
+  fi
+
+  #
+  # Backup tablespace_map file
+  #
+
+  mkdir -p ${BACKUP_DIR_FULL_TBSMAP}
+
+  cp -p $PGDATA/tablespace_map ${BACKUP_DIR_FULL_TBSMAP}
+
+  COMMAND="save -v -g $SAVEGROUP $RETENTION_ARGS ${BACKUP_DIR_FULL_TBSMAP}/"
+  echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} running $COMMAND"
+  eval $COMMAND
+
+  RC=$?
+
+  if [ $RC -ne 0 ]; then
+    echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_ERROR} error occured while running save command"
+    exit 1
+  fi
+
+  rm -Rf ${BACKUP_DIR_FULL_TBSMAP}
+
+  #
+  # Backup Pg cluster files
+  #
+
+  mkdir -p ${BACKUP_DIR_FULL_DATA}
+  mkfifo ${BACKUP_DIR_FULL_DATA}/${PIPE_NAME}
+
+  cd $PGDATA
+
+  # --transform 's,^,data/,S'
+  COMMAND="$TAR --create --preserve-permissions --warning=no-file-changed --warning=no-file-removed --totals --blocking-factor 64 --dereference --file ${BACKUP_DIR_FULL_DATA}/${PIPE_NAME} --directory $PGDATA --exclude pg_xlog --exclude pg_wal --exclude postmaster.pid --exclude postmaster.opts --exclude pg_replslot --exclude pg_dynshmem --exclude pg_notify --exclude pg_serial --exclude pg_snapshots --exclude pg_stat_tmp --exclude pg_subtrans . &"
+  echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} (backgrund) running $COMMAND"
+  eval $COMMAND
+
+  cat <<EOT > ${BACKUP_DIR_FULL_DATA}/.nsr
+<< $BACKUP_DIR_FULL_DATA >>
+rawasm: ${PIPE_NAME}
+EOT
+
+  COMMAND="save -v -g $SAVEGROUP $RETENTION_ARGS ${BACKUP_DIR_FULL_DATA}/"
+  echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} running $COMMAND"
+  eval $COMMAND
+
+  RC=$?
+
+  if [ $RC -ne 0 ]; then
+    echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_ERROR} error occured while running save command"
+    exit 1
+  fi
+
+  rm -Rf ${BACKUP_DIR_FULL_DATA}
+ 
+  #
+  # Stop instance backup
+  #
+
+  # COMMAND="$PGHOME/bin/psql -X -h $DATABASE_SERVER_HOSTNAME -p $PGPORT -U $BACKUP_ROLE -c \"SELECT pg_stop_backup()\" postgres"
+  COMMAND="$PGHOME/bin/psql -X -U $BACKUP_ROLE -c \"SELECT pg_stop_backup()\" postgres"
+  echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} running $COMMAND"
+  eval $COMMAND
+
+  RC=$?
+
+  if [ $RC -ne 0 ]; then
+    echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_ERROR} error occured while calling pg_stop_backup() function"
+    exit 1
+  fi
+
+  env PGOPTIONS="-c log_statement=none -c log_min_messages=panic -c log_min_error_statement=panic" $PGHOME/bin/psql -X -U $BACKUP_ROLE -c 'drop table tarch_backup' postgres 1>/dev/null 2>/dev/null
+  env PGOPTIONS="-c log_statement=none -c log_min_messages=panic -c log_min_error_statement=panic" $PGHOME/bin/psql -X -U $BACKUP_ROLE -c 'create table tarch_backup as select * from generate_series(1,10)' postgres 1>/dev/null 2>/dev/null
+  env PGOPTIONS="-c log_statement=none -c log_min_messages=panic -c log_min_error_statement=panic" $PGHOME/bin/psql -X -U $BACKUP_ROLE -c 'drop table tarch_backup' postgres 1>/dev/null 2>/dev/null
+  env PGOPTIONS="-c log_statement=none -c log_min_messages=panic -c log_min_error_statement=panic" $PGHOME/bin/psql -X -U $BACKUP_ROLE -c 'select pg_switch_xlog()' postgres 1>/dev/null 2>/dev/null
+  env PGOPTIONS="-c log_statement=none -c log_min_messages=panic -c log_min_error_statement=panic" $PGHOME/bin/psql -X -U $BACKUP_ROLE -c 'select pg_switch_wal()' postgres 1>/dev/null 2>/dev/null
+  sleep 5
+
+  #
+  # Save archived WAL files
+  #
+
+  mkdir -p ${BACKUP_DIR_FULL_ARCH}
+  mkfifo ${BACKUP_DIR_FULL_ARCH}/${PIPE_NAME}
+
+  cd $ARCHIVE_DIR
+
+  # tail -n +2
+  ARCHIVED_WAL_LIST=$(ls -1r [0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F] 2>/dev/null| sort | tr '\n' ' ' 2>/dev/null)
+
+  if [ -n "$ARCHIVED_WAL_LIST" ]; then
+    # --transform 's,^,archive/,S'
+    COMMAND="$TAR --create --preserve-permissions --warning=no-file-removed --totals --blocking-factor 64 --dereference --file ${BACKUP_DIR_FULL_ARCH}/${PIPE_NAME} --directory $ARCHIVE_DIR --no-recursion $ARCHIVED_WAL_LIST &"
+    echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} (backgrund) running $COMMAND"
+    eval $COMMAND
+
+    cat <<EOT > ${BACKUP_DIR_FULL_ARCH}/.nsr
+<< $BACKUP_DIR_FULL_ARCH >>
+rawasm: ${PIPE_NAME}
+EOT
+
+    COMMAND="save -v -g $SAVEGROUP $RETENTION_ARGS ${BACKUP_DIR_FULL_ARCH}/"
+    echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} running $COMMAND"
+    eval $COMMAND
+
+    RC=$?
+
+    if [ $RC -ne 0 ]; then
+      echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_ERROR} error occured while running save command"
+      exit 1
+    fi
+
+    cd $ARCHIVE_DIR
+    echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} deleting archived WAL file(s)"
+
+    for ALOG in $ARCHIVED_WAL_LIST ; do
+      echo "archived WAL file=${ARCHIVE_DIR}/${ALOG}"
+      rm -f ${ARCHIVE_DIR}/${ALOG}
+    done
+
+  fi
+
+  rm -Rf ${BACKUP_DIR_FULL_ARCH}
+
+
+elif [ "$BACKUP_TYPE" == "ARCH" ]; then
+
+  env PGOPTIONS="-c log_statement=none -c log_min_messages=panic -c log_min_error_statement=panic" $PGHOME/bin/psql -X -U $BACKUP_ROLE -c 'drop table tarch_backup' postgres 1>/dev/null 2>/dev/null
+  env PGOPTIONS="-c log_statement=none -c log_min_messages=panic -c log_min_error_statement=panic" $PGHOME/bin/psql -X -U $BACKUP_ROLE -c 'create table tarch_backup as select * from generate_series(1,10)' postgres 1>/dev/null 2>/dev/null
+  env PGOPTIONS="-c log_statement=none -c log_min_messages=panic -c log_min_error_statement=panic" $PGHOME/bin/psql -X -U $BACKUP_ROLE -c 'drop table tarch_backup' postgres 1>/dev/null 2>/dev/null
+  env PGOPTIONS="-c log_statement=none -c log_min_messages=panic -c log_min_error_statement=panic" $PGHOME/bin/psql -X -U $BACKUP_ROLE -c 'select pg_switch_xlog()' postgres 1>/dev/null 2>/dev/null
+  env PGOPTIONS="-c log_statement=none -c log_min_messages=panic -c log_min_error_statement=panic" $PGHOME/bin/psql -X -U $BACKUP_ROLE -c 'select pg_switch_wal()' postgres 1>/dev/null 2>/dev/null
+  sleep 5
+
+  #
+  # Save archived WAL files
+  #
+
+  mkdir -p ${BACKUP_DIR_ARCH}
+  mkfifo ${BACKUP_DIR_ARCH}/${PIPE_NAME}
+
+  cd $ARCHIVE_DIR
+
+  # tail -n +2
+  ARCHIVED_WAL_LIST=$(ls -1r [0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F] 2>/dev/null| sort | tr '\n' ' ' 2>/dev/null)
+
+  if [ -n "$ARCHIVED_WAL_LIST" ]; then
+    # --transform 's,^,archive/,S'
+    COMMAND="$TAR --create --preserve-permissions --warning=no-file-removed --totals --blocking-factor 64 --dereference --file ${BACKUP_DIR_ARCH}/${PIPE_NAME} --directory $ARCHIVE_DIR --no-recursion $ARCHIVED_WAL_LIST &"
+    echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} (backgrund) running $COMMAND"
+    eval $COMMAND
+
+    cat <<EOT > ${BACKUP_DIR_ARCH}/.nsr
+<< $BACKUP_DIR_ARCH >>
+rawasm: ${PIPE_NAME}
+EOT
+
+    COMMAND="save -v -g $SAVEGROUP $RETENTION_ARGS ${BACKUP_DIR_ARCH}/"
+    echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} running $COMMAND"
+    eval $COMMAND
+
+    RC=$?
+
+    if [ $RC -ne 0 ]; then
+      echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_ERROR} error occured while running save command"
+      exit 1
+    fi
+
+    cd $ARCHIVE_DIR
+    echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} deleting archived WAL file(s)"
+
+    for ALOG in $ARCHIVED_WAL_LIST ; do
+      echo "archived WAL file=${ARCHIVE_DIR}/${ALOG}"
+      rm -f ${ARCHIVE_DIR}/${ALOG}
+    done
+
+  fi
+
+  rm -Rf ${BACKUP_DIR_ARCH}
+
+fi
+
+SAVEGROUPdbfull=$(echo $SAVEGROUP | sed 's/arch$/full/')
+SAVEGROUPdbarch=$(echo $SAVEGROUP | sed 's/full$/arch/')
+
+COMMAND="mminfo -s $NSR_SERVER -oRt -r 'name,group,pool,savetime(22),totalsize(3),ssid,volretent' -q \"client=${NSR_CLIENT},savetime>=last day,group=${SAVEGROUPdbfull},group=${SAVEGROUPdbarch}\""
+
+echo
+echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} List last day backups"
+echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} running $COMMAND"
+eval $COMMAND
+echo
+
+echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} $SCRIPT completed at $(date +%Y-%m-%d_%H:%M:%S)"
+echo
+
+exit 0
+

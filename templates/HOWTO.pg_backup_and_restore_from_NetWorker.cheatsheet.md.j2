@@ -1,0 +1,198 @@
+
+HOWTO backup and restore PostgreSQL from NetWorker
+==================================================
+
+This is a simple cheatsheet how to backup and restore PostgreSQL instance from NetWorker
+
+
+Backup and recovery scripts location
+------------------------------------
+
+    $ cd {{ postgresql_nsr_backup_nsr_scripts_directory }}
+
+
+List available backups
+----------------------
+
+* List all backups for this nsr client
+
+    $ nsr_pg_backup_list.sh --verbose
+
+* List backups completed within last 2 days, for this nsr client
+
+    $ nsr_pg_backup_list.sh -t "2 days ago" --verbose
+
+* List backups of INSTANCE_NAME instance (savegroup names: {{ postgresql_nsr_backup_default_savegroup_prefix }}_INSTANCE_NAME_{{ ansible_hostname }}_db*)
+
+    $ nsr_pg_backup_list.sh --verbose --instance=INSTANCE_NAME
+
+* List backups of INSTANCE_NAME instance, savegroup name explicitly provided
+
+    $ nsr_pg_backup_list.sh --verbose --instance=INSTANCE_NAME --savegroup=SAVEGROUP
+
+* List backups of INSTANCE_NAME instance from BACKUP_CLIENT explicitly provided (list of backups done on a different host)
+
+    $ nsr_pg_backup_list.sh --verbose --instance=INSTANCE_NAME --backup-client=BACKUP_CLIENT
+
+* List all backups from a different host
+
+    $ nsr_pg_backup_list.sh --verbose --backup-client=BACKUP_CLIENT
+
+
+Run a FULL backup
+-----------------
+
+* Full backup in verbose mode without a logfile (default savegroup name: {{ postgresql_nsr_backup_default_savegroup_prefix }}_INSTANCE_NAME_{{ ansible_hostname }}_dbfull)
+
+    $ nsr_pg_backup.sh --instance=INSTANCE_NAME --verbose --backup-type=FULL
+
+* Full backup in verbose mode without a logfile, savegroup name explicitly provided
+
+    $ nsr_pg_backup.sh --instance=INSTANCE_NAME --verbose --backup-type=FULL --savegroup=SAVEGROUP
+ 
+* Full backup in verbose mode with a logfile
+
+    $ nsr_pg_backup.sh --instance=INSTANCE_NAME --verbose --backup-type=FULL --log-dir={{ postgresql_nsr_backup_nsr_scripts_log_directory }}
+
+
+
+Run an ARCHived WAL file backup
+-------------------------------
+
+* Arch backup in verbose mode without a logfile (default savegroup name: {{ postgresql_nsr_backup_default_savegroup_prefix }}_INSTANCE_NAME_{{ ansible_hostname }}_dbarch)
+
+    $ nsr_pg_backup.sh --instance=INSTANCE_NAME --verbose --backup-type=ARCH
+
+* Arch backup in verbose mode without a logfile, savegroup name explicitly provided
+
+    $ nsr_pg_backup.sh --instance=INSTANCE_NAME --verbose --backup-type=ARCH --savegroup=SAVEGROUP
+
+* Arch backup in verbose mode with a logfile
+
+    $ nsr_pg_backup.sh --instance=INSTANCE_NAME --verbose --backup-type=ARCH --log-dir={{ postgresql_nsr_backup_nsr_scripts_log_directory }}
+
+
+Run emergency ARCHived WAL file backup
+--------------------------------------
+
+* Trigger ARCH backup when arch filesystem usage threshold is exceeded (--threshold in percent)
+
+    $ nsr_pg_backup_wal_archives_emergency.sh --verbose --threshold=40
+
+
+Restore tablespace_map file
+---------------------------
+
+* Restore tablespace_map file from the last INSTANCE_NAME backup to the original backup location
+
+    $ nsr_pg_restore_tablespace_map.sh --instance=INSTANCE_NAME --verbose
+
+* Restore tablespace_map file from the last INSTANCE_NAME backup to the alternate location
+
+    $ nsr_pg_restore_tablespace_map.sh --instance=INSTANCE_NAME --verbose --restore-dir=/postgres/backup/nsrbackup/tbsmap_restore
+
+* Restore tablespace_map file from the last backup completed before "2018-11-22 11:15:00" timestamp
+
+    $ nsr_pg_restore_tablespace_map.sh --instance=INSTANCE_NAME --verbose -r "2018-11-22 11:15:00"
+
+* Restore tablespace_map file from the last INSTANCE_NAME backup to the alternate location, backup client explicitly provided (i.e. backup source)
+
+    $ nsr_pg_restore_tablespace_map.sh --instance=INSTANCE_NAME --verbose --restore-dir=/postgres/backup/nsrbackup/tbsmap_restore --backup-client={{ inventory_hostname }}
+
+
+Restore archived WAL files
+--------------------------
+
+* Restore archived WAL files from the last ARCH backup to the default location
+
+    $ nsr_pg_restore_wal_archives.sh --verbose --instance=INSTANCE_NAME
+
+* Restore archived WAL files from the last ARCH backup to the alternate location
+
+    $ nsr_pg_restore_wal_archives.sh --verbose --instance=INSTANCE_NAME --restore-dir=/postgres/backup/nsrbackup/other_location
+
+* Restore archived WAL files from the last ARCH backup to the alternate location, backup client explicitly provided (i.e. backup source)
+
+    $ nsr_pg_restore_wal_archives.sh --verbose --instance=INSTANCE_NAME --restore-dir=/alternate/location --backup-client={{ inventory_hostname }}
+
+* Restore archived WAL files from all backups completed between provided tags
+
+    $ nsr_pg_restore_wal_archives.sh --verbose --instance=INSTANCE_NAME --from-tag=TAG20181122T111114 --to-tag=TAG20181122T115617
+
+* Restore archived WAL files from all backups completed between provided tags to the alternate location
+
+    $ nsr_pg_restore_wal_archives.sh --verbose --instance=INSTANCE_NAME --from-tag=TAG20181122T111114 --to-tag=TAG20181122T115617 --restore-dir=/alternate/location
+
+* Restore archived WAL files from all backups completed between provided time frame
+
+    $ nsr_pg_restore_wal_archives.sh --verbose --instance=INSTANCE_NAME --from-time="2018-11-22 11:57:00" --until-time="2018-11-22 12:00:00"
+
+* Restore archived WAL files from all backups completed between provided time frame to the alternate location
+
+    $ nsr_pg_restore_wal_archives.sh --verbose --instance=INSTANCE_NAME --from-time="2018-11-22 11:57:00" --until-time="2018-11-22 12:00:00" --restore-dir=/alternate/location
+
+
+Restore a Postgres cluster (do not perform recovery)
+----------------------------------------------------
+
+* Restore a cluster from the last full backup, leave tablespaces in the original locations, do not perform recovery
+
+    $ nsr_pg_restore_instance.sh --verbose --instance=INSTANCE_NAME --mode=restore --restore-pgdata-dir=/postgres/backup/nsrbackup/test_pgdata --tablespace-mapping=original-locations
+
+* Restore a cluster from the backup marked with a provided tag, leave tablespaces in the original locations, do not perform recovery
+
+    $ pg_nsr_restore_instance.sh --verbose --instance=INSTANCE_NAME --mode=restore --restore-pgdata-dir=/postgres/backup/nsrbackup/test_pgdata --tablespace-mapping=original-locations --from-tag=TAG20181027T215842
+
+* Restore a cluster from the backup marked with a provided tag, change the location of tablespaces according to the mapping parameter, do not perform recovery
+
+    $ pg_nsr_restore_instance.sh --verbose --instance=INSTANCE_NAME --mode=restore --restore-pgdata-dir=/postgres/backup/nsrbackup/test_pgdata_restore --tablespace-mapping=/postgres/data/INSTANCE_NAME/NEXT_TAO_TEMP=/postgres/backup/nsrbackup/test_tbs_restore/NEXT_TAO_TEMP --tablespace-mapping=/postgres/data/INSTANCE_NAME/NEXT_TAO_DATA=/postgres/backup/nsrbackup/test_tbs_restore/NEXT_TAO_DATA --from-tag=TAG20181027T215842
+
+* Restore a cluster from the last backup completed before provided time, change the location of tablespaces according to the mapping parameter, do not perform recovery, backup client explicitly provided (i.e. backup source)
+
+    $ nsr_pg_restore_instance.sh --verbose --instance=INSTANCE_NAME --mode=restore --restore-pgdata-dir=/postgres/backup/nsrbackup/test_pgdata_restore --tablespace-mapping=/postgres/data/INSTANCE_NAME/NEXT_TAO_TEMP=/postgres/backup/nsrbackup/test_tbs_restore/NEXT_TAO_TEMP --tablespace-mapping=/postgres/data/INSTANCE_NAME/NEXT_TAO_DATA=/postgres/backup/nsrbackup/test_tbs_restore/NEXT_TAO_DATA --from-time="2018-11-22 13:20:00" --backup-client={{ inventory_hostname }}
+
+
+Recover a Postgres cluster (do not perform restore)
+---------------------------------------------------
+
+Recover a Postgres cluster to the lastest point, using --pghome-dir binaries, restore required archived WAL files (if necessary) to --restore-archive-dir
+
+    $ pg_nsr_restore_instance.sh --verbose --instance=INSTANCE_NAME --mode=recovery --restore-archive-dir=/postgres/backup/nsrbackup/test_pgarch_restore --pghome-dir=/postgres/apps/homes/foo-postgresql-9.6.10
+
+Recover a Postgres cluster to the lastest point, PGDATA indicated by --restore-pgdata-dir, using --pghome-dir binaries, restore required archived WAL files (if necessary) to --restore-archive-dir
+
+    $ pg_nsr_restore_instance.sh --verbose --instance=INSTANCE_NAME --mode=recover --restore-pgdata-dir=/postgres/backup/nsrbackup/test_pgdata_restore --restore-archive-dir=/postgres/backup/nsrbackup/test_pgarch_restore --pghome-dir=/postgres/apps/homes/foo-postgresql-9.6.10
+
+Recover a Postgres cluster to the time specified by a tag, PGDATA indicated by --restore-pgdata-dir, using --pghome-dir binaries, restore required archived WAL files (if necessary) to --restore-archive-dir
+
+    $ pg_nsr_restore_instance.sh --verbose --instance=INSTANCE_NAME --mode=recover --restore-pgdata-dir=/postgres/backup/nsrbackup/test_pgdata_restore --restore-archive-dir=/postgres/backup/nsrbackup/test_pgarch_restore --pghome-dir=/postgres/apps/homes/foo-postgresql-9.6.10 --to-tag=TAG20181027T215842
+
+Recover a Postgres cluster to the time specified by --until-time parameter, PGDATA indicated by --restore-pgdata-dir, using --pghome-dir binaries, restore required archived WAL files (if necessary) to --restore-archive-dir
+
+    $ pg_nsr_restore_instance.sh --verbose --instance=INSTANCE_NAME --mode=recover --restore-pgdata-dir=/postgres/backup/nsrbackup/test_pgdata_restore --restore-archive-dir=/postgres/backup/nsrbackup/test_pgarch_restore --pghome-dir=/postgres/apps/homes/foo-postgresql-9.6.10 --until-time="2018-10-26 23:00:00"
+
+
+Restore and Recover a Postgres cluster
+--------------------------------------
+
+* Restore and recover a cluster from the last backups, leave tablespaces in the original locations, PGDATA indicated by --restore-pgdata-dir, using --pghome-dir binaries, restore required archived WAL files (if necessary) to --restore-archive-dir
+
+    $ pg_nsr_restore_instance.sh --verbose --instance=INSTANCE_NAME --mode=restore-and-recover --restore-pgdata-dir=/postgres/backup/nsrbackup/test_pgdata_restore --tablespace-mapping=original-locations --restore-archive-dir=/postgres/backup/nsrbackup/test_pgarch_restore --pghome-dir=/postgres/apps/homes/foo-postgresql-9.6.10
+
+* Restore and recover a cluster from the last backups, change the location of tablespaces according to the mapping parameter, PGDATA indicated by --restore-pgdata-dir, using --pghome-dir binaries, restore required archived WAL files (if necessary) to --restore-archive-dir, backup client explicitly provided (i.e. backup source)
+
+    $ nsr_pg_restore_instance.sh --verbose --instance=INSTANCE_NAME --mode=restore-and-recover --restore-pgdata-dir=/postgres/backup/nsrbackup/test_pgdata_restore --tablespace-mapping=/postgres/data/INSTANCE_NAME/NEXT_TAO_TEMP=/postgres/backup/nsrbackup/test_tbs_restore/NEXT_TAO_TEMP --tablespace-mapping=/postgres/data/INSTANCE_NAME/NEXT_TAO_DATA=/postgres/backup/nsrbackup/test_tbs_restore/NEXT_TAO_DATA --restore-archive-dir=/postgres/backup/nsrbackup/test_pgarch_restore --pghome-dir=/postgres/apps/homes/foo-postgresql-9.6.10 --backup-client={{ inventory_hostname }}
+
+* Restore and recover a cluster to the time specified by a tag, change the location of tablespaces according to the mapping parameter, PGDATA indicated by --restore-pgdata-dir, using --pghome-dir binaries, restore required archived WAL files (if necessary) to --restore-archive-dir, backup client explicitly provided (i.e. backup source)
+ 
+    $ pg_nsr_restore_instance.sh --verbose --instance=INSTANCE_NAME --mode=restore-and-recover --restore-pgdata-dir=/postgres/backup/nsrbackup/test_pgdata_restore --tablespace-mapping=/postgres/data/INSTANCE_NAME/NEXT_TAO_TEMP=/postgres/backup/nsrbackup/test_tbs_restore/NEXT_TAO_TEMP --tablespace-mapping=/postgres/data/INSTANCE_NAME/NEXT_TAO_DATA=/postgres/backup/nsrbackup/test_tbs_restore/NEXT_TAO_DATA --restore-archive-dir=/postgres/backup/nsrbackup/test_pgarch_restore --pghome-dir=/postgres/apps/homes/foo-postgresql-9.6.10 --to-tag=TAG20181027T215842
+
+* Restore and recover a cluster to the time specified by --until-time, change the location of tablespaces according to the mapping parameter, PGDATA indicated by --restore-pgdata-dir, using --pghome-dir binaries, restore required archived WAL files (if necessary) to --restore-archive-dir, backup client explicitly provided (i.e. backup source)
+
+    $ nsr_pg_restore_instance.sh --verbose --instance=INSTANCE_NAME --mode=restore-and-recover --restore-pgdata-dir=/postgres/backup/nsrbackup/test_pgdata_restore --tablespace-mapping=/postgres/data/INSTANCE_NAME/NEXT_TAO_TEMP=/postgres/backup/nsrbackup/test_tbs_restore/NEXT_TAO_TEMP --tablespace-mapping=/postgres/data/INSTANCE_NAME/NEXT_TAO_DATA=/postgres/backup/nsrbackup/test_tbs_restore/NEXT_TAO_DATA --restore-archive-dir=/postgres/backup/nsrbackup/test_pgarch_restore --pghome-dir=/postgres/apps/homes/foo-postgresql-9.6.10 --until-time="2018-11-22 13:20:00"
+
+* The same as above, but the backup client explicitly provided (i.e. backup source)
+
+    $ nsr_pg_restore_instance.sh --verbose --instance=INSTANCE_NAME --mode=restore-and-recover --restore-pgdata-dir=/postgres/backup/nsrbackup/test_pgdata_restore --tablespace-mapping=/postgres/data/INSTANCE_NAME/NEXT_TAO_TEMP=/postgres/backup/nsrbackup/test_tbs_restore/NEXT_TAO_TEMP --tablespace-mapping=/postgres/data/INSTANCE_NAME/NEXT_TAO_DATA=/postgres/backup/nsrbackup/test_tbs_restore/NEXT_TAO_DATA --restore-archive-dir=/postgres/backup/nsrbackup/test_pgarch_restore --pghome-dir=/postgres/apps/homes/foo-postgresql-9.6.10 --until-time="2018-11-22 13:20:00" --backup-client={{ inventory_hostname }}
+
+

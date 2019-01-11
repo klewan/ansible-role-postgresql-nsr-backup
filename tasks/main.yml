@@ -1,0 +1,129 @@
+---
+
+#
+# .nsr files - exclude filesystems and directories in .nsr NetWorker directive file
+#
+
+- name: create .nsr file
+  template:
+    src: dot_nsr.j2
+    dest: "{{ item }}/.nsr"
+    mode: 0644
+  with_items:
+    - "{{ postgresql_nsr_backup_datavg_mountpoint_prefix }}/archive"
+    - "{{ postgresql_nsr_backup_datavg_mountpoint_prefix }}"
+  loop_control:
+    label: "[file: {{ item }}/.nsr]"
+  when: postgresql_nsr_backup_configure_dot_nsr_files
+  tags:
+    - postgresql_nsr_backup_configure_dot_nsr_files
+
+- name: create .nsr files (instances)
+  template:
+    src: dot_nsr_instance.j2
+    dest: "{{ postgresql_nsr_backup_instance_directory }}/.nsr"
+    mode: 0644
+  with_subelements:
+    - "{{ postgresql_clusters }}"
+    - filesystem
+  loop_control:
+    label: "[file: {{ postgresql_nsr_backup_instance_directory }}/.nsr]"
+  when: postgresql_nsr_backup_configure_dot_nsr_files
+  tags:
+    - postgresql_nsr_backup_configure_dot_nsr_files
+
+- name: create .nsr files | (databases)
+  include: database_fs_exclude.yml pg_instance={{ outer_item }}
+  with_items:
+    - "{{ postgresql_clusters }}"
+  loop_control:
+    label: "[instnace: {{ outer_item.name }}]"
+    loop_var: outer_item
+  when: postgresql_nsr_backup_configure_dot_nsr_files
+  tags:
+    - postgresql_nsr_backup_configure_dot_nsr_files
+
+#
+# NSR scripts
+#
+
+- name: ensure NSR scripts directories exists
+  file:
+    dest: "{{ item }}"
+    state: directory
+    owner: "{{ postgresql_user }}"
+  with_items:
+    - "{{ postgresql_nsr_backup_nsr_scripts_directory }}"
+    - "{{ postgresql_nsr_backup_nsr_scripts_log_directory }}"
+  loop_control:
+    label: "[directory: {{ item }}]"
+  tags:
+    - postgresql_nsr_backup_scripts
+    - postgresql_nsr_backup_postgres_scripts
+    - postgresql_nsr_backup_scripts_directories
+
+- name: copy backup scripts to /bin directory
+  template:
+    src: "{{ item }}.j2"
+    dest: "/bin/{{ item }}"
+    owner: root
+    group: root
+    mode: 0755
+  become: yes
+  become_user: root
+  with_items:
+    - nsr_pg_backup
+    - nsr_pg_backup_probe
+  loop_control:
+    label: "[script: {{ item }}]"
+  when: postgresql_nsr_backup_copy_root_scripts
+  tags:
+    - postgresql_nsr_backup_scripts
+    - postgresql_nsr_backup_root_scripts
+
+- name: create symlinks in /sbin
+  file:
+    src: "/bin/{{ item }}"
+    dest: "/sbin/{{ item }}"
+    force: yes
+    state: link
+  become: yes
+  become_user: root
+  with_items:
+    - nsr_pg_backup
+    - nsr_pg_backup_probe
+  loop_control:
+    label: "[sym-link: /sbin/{{ item }}]"
+  when: postgresql_nsr_backup_copy_root_scripts
+  tags:
+    - postgresql_nsr_backup_scripts
+    - postgresql_nsr_backup_root_scripts
+
+- name: copy backup and recovery scripts
+  template:
+    src: "{{ item }}.j2"
+    dest: "{{ postgresql_nsr_backup_nsr_scripts_directory }}/{{ item }}"
+    owner: "{{ postgresql_user }}"
+    group: "{{ postgresql_group }}"
+    mode: 0755
+  with_items: "{{ postgresql_nsr_backup_nsr_scripts_templates }}"
+  loop_control:
+    label: "[script: {{ postgresql_nsr_backup_nsr_scripts_directory }}/{{ item }}]"
+  tags:
+    - postgresql_nsr_backup_scripts
+    - postgresql_nsr_backup_postgres_scripts
+
+- name: copy HOWTO cheatsheet file
+  template:
+    src: HOWTO.pg_backup_and_restore_from_NetWorker.cheatsheet.md.j2
+    dest: "{{ postgresql_nsr_backup_nsr_scripts_directory }}/HOWTO.pg_backup_and_restore_from_NetWorker.cheatsheet.md"
+    owner: "{{ postgresql_user }}"
+    group: "{{ postgresql_group }}"
+    mode: 0644
+  tags:
+    - postgresql_nsr_backup_scripts
+    - postgresql_nsr_backup_postgres_scripts
+    - postgresql_nsr_backup_howto_cheatsheet
+
+- import_tasks: backup_wal_archives_emergency_setup.yml
+

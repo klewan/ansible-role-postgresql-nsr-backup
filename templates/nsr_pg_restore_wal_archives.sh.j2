@@ -1,0 +1,346 @@
+#!/bin/sh
+# File: pg_nsr_restore_wal_archives.sh
+#
+# Restore PostgreSQL WAL file archives from NetWorker
+#
+# History:
+#
+# Date       Author       Comments
+# ---------- ------------ ----------------------------------------------
+# 25/10/2018 KLewandowski Created
+# ----------------------------------------------------------------------
+#
+
+
+#
+# Variables
+#
+
+DIR=$(dirname $0)
+SCRIPT="$(basename $0 .sh)"
+CURRENT_TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+NSR_SERVER=$(awk ' $1!~ /[#*]/ {print $1} ' /nsr/res/servers 2>/dev/null| head -1)
+NSR_CLIENT="$(hostname -s)-nsr.$(echo $NSR_SERVER | awk -F. '{$1="";OFS="." ; print $0}' | sed 's/^.//')"
+VERBOSE=0
+ECHO_INFO="INFO> "
+ECHO_ERROR="ERROR> "
+ARCHIVE_DIR_PREFIX={{ postgresql_nsr_backup_default_archive_dir_prefix }}
+RECOVER=$(which recover)
+
+#
+# Parameters (default values)
+#
+
+#
+# Functions
+#
+
+function usage()
+{
+  cat <<EOT
+
+Restore PostgreSQL WAL file archives from NetWorker
+
+Usage:
+  $0 [OPTION]...
+
+Options:
+   -h, --help                    show this help, then exit (optional)
+   -v, --verbose                 verbose mode (optional)
+   -i, --instance=INSTANCENAME   run restore for this PostgreSQL instance (mandatory)
+   -g, --savegroup=SAVEGROUP     run restore for this NetWorker save group (optional)
+   -c, --backup-client=CLIENT    name of the machine that saved the files (optional) [default: $(hostname -s)]
+   -t, --from-tag=FROM_TAG
+   -T, --to-tag=TO_TAG
+                                 restore WAL file archives from FROM_TAG up to TO_TAG (TAG<date>T<time>) (optional)
+                                 FROM_TAG - starting point ; TO_TAG - ending point
+   -f, --from-time=FROM_TIME          
+   -u, --until-time=UNTIL_TIME
+                                 restore WAL file archives FROM_TIME (lower limit) UNTIL_TIME (upper limit) (optional)
+                                   e.g.: "2018-10-26 12:30:00"
+   -d, --restore-dir=DIRECTORY   the destination directory to relocate recovered files (optional) [default: ${ARCHIVE_DIR_PREFIX}/INSTANCENAME/restore]
+   -L, --log-dir=DIRECTORY       send session log to this directory (optional)
+
+EOT
+}
+
+
+#
+# args parsing
+#
+
+while (( "$#" )); do
+  case "$1" in
+    -i)
+      INSTANCENAME=$2
+      shift 2
+      ;;
+    --instance=*)
+      INSTANCENAME="${1#*=}"
+      shift
+      ;;
+    -d)
+      RESTORE_DIR=$2
+      shift 2
+      ;;
+    --restore-dir=*)
+      RESTORE_DIR="${1#*=}"
+      shift
+      ;;
+    -c)
+      BACKUP_CLIENT=$2
+      shift 2
+      ;;
+    --backup-client=*)
+      BACKUP_CLIENT="${1#*=}"
+      shift
+      ;;
+    -g)
+      SAVEGROUP=$2
+      shift 2
+      ;;
+    --savegroup=*)
+      SAVEGROUP="${1#*=}"
+      shift
+      ;;
+    -t)
+      FROM_TAG=$2
+      shift 2
+      ;;
+    --from-tag=*)
+      FROM_TAG="${1#*=}"
+      shift
+      ;;
+    -T)
+      TO_TAG=$2
+      shift 2
+      ;;
+    --to-tag=*)
+      TO_TAG="${1#*=}"
+      shift
+      ;;
+    -f)
+      FROM_TIME=$2
+      shift 2
+      ;;
+    --from-time=*)
+      FROM_TIME="${1#*=}"
+      shift
+      ;;
+    -u)
+      UNTIL_TIME=$2
+      shift 2
+      ;;
+    --until-time=*)
+      UNTIL_TIME="${1#*=}"
+      shift
+      ;;
+    -L)
+      LOG_DIR=$2
+      shift 2
+      ;;
+    --log-dir=*)
+      LOG_DIR="${1#*=}"
+      shift
+      ;;
+    -v|--verbose)
+      VERBOSE=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      shift
+      exit 0
+      ;;
+    -*|--*=) # unsupported flags
+      echo "ERROR: Unsupported flag $1" >&2
+      usage
+      exit 1
+      ;;
+    *)
+      echo "ERROR: Unknown parameter $1" >&2
+      usage
+      exit 1
+      ;;
+  esac
+done
+
+if [ -z "$BACKUP_CLIENT" ]; then
+  BACKUP_CLIENT=$(hostname -s)
+fi
+
+NSR_CLIENT="${BACKUP_CLIENT}-nsr.$(echo $NSR_SERVER | awk -F. '{$1="";OFS="." ; print $0}' | sed 's/^.//')"
+
+if [ -z "$INSTANCENAME" ]; then
+  echo "${ECHO_ERROR}: Mandatory parameter '--instance=INSTANCENAME' not provided"
+  usage
+  exit 1
+fi
+
+if [ ! -z "$LOG_DIR" ]; then
+  echo "Logfile -> $LOG_DIR/${SCRIPT}.${INSTANCENAME}.${CURRENT_TIMESTAMP}"
+  exec 1>>$LOG_DIR/${SCRIPT}.${INSTANCENAME}.${CURRENT_TIMESTAMP} 2>&1
+fi
+
+if [ -z "$SAVEGROUP" ]; then
+  SAVEGROUPdbfull="{{ postgresql_nsr_backup_default_savegroup_prefix }}_${INSTANCENAME}_${BACKUP_CLIENT}_dbfull"
+  SAVEGROUPdbarch="{{ postgresql_nsr_backup_default_savegroup_prefix }}_${INSTANCENAME}_${BACKUP_CLIENT}_dbarch"
+  SAVEGROUP=$SAVEGROUPdbarch
+else
+  SAVEGROUPdbfull=$(echo $SAVEGROUP | sed 's/arch$/full/')
+  SAVEGROUPdbarch=$(echo $SAVEGROUP | sed 's/full$/arch/')
+fi
+
+SAVEGROUP_QUERY="group=${SAVEGROUPdbfull},group=${SAVEGROUPdbarch}"
+
+if [ ! -z "$FROM_TAG" -a -z "$TO_TAG" ] || [ -z "$FROM_TAG" -a ! -z "$TO_TAG" ]; then
+  echo "${ECHO_ERROR}: Either both --from-tag and --to-tag should be provided or none of them"
+  usage
+  exit 1
+fi
+
+if [ ! -z "$FROM_TIME" -a -z "$UNTIL_TIME" ] || [ -z "$FROM_TIME" -a ! -z "$UNTIL_TIME" ]; then
+  echo "${ECHO_ERROR}: Either both --from-time and --until-time should be provided or none of them"
+  usage
+  exit 1
+fi
+
+if [ ! -z "$FROM_TAG" ]; then
+  unset FROM_TIME
+  unset UNTIL_TIME
+fi
+
+if [ -z "$RESTORE_DIR" ]; then
+  RESTORE_DIR=$ARCHIVE_DIR_PREFIX/${INSTANCENAME}/restore
+fi
+
+#
+# The real stuff starts here
+#
+
+echo
+echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} $SCRIPT started at $(date +%Y-%m-%d_%H:%M:%S)"
+echo
+
+if [ $VERBOSE -eq 1 ]; then
+  echo "--> (PARAMETERS) :: INSTANCENAME:         $INSTANCENAME"
+  echo "--> (PARAMETERS) :: SAVEGROUP:            $SAVEGROUP"
+  echo "--> (PARAMETERS) :: FROM_TAG:             $FROM_TAG"
+  echo "--> (PARAMETERS) :: TO_TAG:               $TO_TAG"
+  echo "--> (PARAMETERS) :: FROM_TIME             $FROM_TIME"
+  echo "--> (PARAMETERS) :: UNTIL_TIME            $UNTIL_TIME"
+  echo "--> (PARAMETERS) :: RESTORE_DIR:          $RESTORE_DIR"
+  echo "--> (PARAMETERS) :: LOG_DIR:              $LOG_DIR"
+  echo
+fi
+
+if [ $VERBOSE -eq 1 ]; then
+  echo "--> (NSR) :: NSR_SERVER:  $NSR_SERVER"
+  echo "--> (NSR) :: NSR_CLIENT:  $NSR_CLIENT"
+  echo
+fi
+
+
+#
+# find save set name
+#
+
+if [ ! -z "$FROM_TAG" ]; then
+
+  FROM_SAVESET_INFO=$(mminfo -s $NSR_SERVER -oRt -r 'name,savetime(22)' -q "client=${NSR_CLIENT},${SAVEGROUP_QUERY}" 2>/dev/null | egrep "(PG_FULL_ARCH_${INSTANCENAME}_${FROM_TAG}|PG_ARCH_${INSTANCENAME}_${FROM_TAG})" | head -1)
+  FROM_SAVETIME=$(echo $FROM_SAVESET_INFO | sed 's/^[^ ]* //')
+  FROM_SAVENAME=$(echo $FROM_SAVESET_INFO | cut -d" " -f1)
+  TO_SAVESET_INFO=$(mminfo -s $NSR_SERVER -oRt -r 'name,savetime(22)' -q "client=${NSR_CLIENT},${SAVEGROUP_QUERY}" 2>/dev/null | egrep "(PG_FULL_ARCH_${INSTANCENAME}_${TO_TAG}|PG_ARCH_${INSTANCENAME}_${TO_TAG})" | head -1)
+  TO_SAVETIME=$(echo $TO_SAVESET_INFO | sed 's/^[^ ]* //')
+  TO_SAVENAME=$(echo $TO_SAVESET_INFO | cut -d" " -f1)
+
+  if [ "$FROM_SAVETIME" != "" -a "$TO_SAVETIME" != "" ]; then
+    echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} Ready to restore all WAL archives from $FROM_SAVENAME ($FROM_SAVETIME) until $TO_SAVENAME ($TO_SAVETIME) save sets"
+  else
+    echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_ERROR} Cannot find a backup for the specified tag $FROM_TAG or $TO_TAG"
+    exit 1
+  fi
+
+else
+
+  if [ -z "$FROM_TIME" ]; then
+    echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} Recovering from the last backup since neither (FROM_|TO_)TAG nor (FROM_|UNTIL_)TIME were specified"
+    FROM_SAVESET_INFO=$(mminfo -s $NSR_SERVER -oRt -r 'name,savetime(22)' -q "client=${NSR_CLIENT},${SAVEGROUP_QUERY}" 2>/dev/null | egrep "(PG_FULL_ARCH_${INSTANCENAME}_TAG|PG_ARCH_${INSTANCENAME}_TAG)" | head -1)
+    FROM_SAVETIME=$(echo $FROM_SAVESET_INFO | sed 's/^[^ ]* //')
+    FROM_SAVENAME=$(echo $FROM_SAVESET_INFO | cut -d" " -f1)
+    TO_SAVETIME=$FROM_SAVETIME
+    TO_SAVENAME=$FROM_SAVENAME
+  else
+    NSR_FROM_TIME=$(date -d"${FROM_TIME}" +%m/%d/%Y" "%H:%M:%S)
+    NSR_UNTIL_TIME=$(date -d"${UNTIL_TIME}" +%m/%d/%Y" "%H:%M:%S)
+    FROM_SAVESET_INFO=$(mminfo -s $NSR_SERVER -oRt -r 'name,savetime(22)' -q "client=${NSR_CLIENT},${SAVEGROUP_QUERY},savetime>=${NSR_FROM_TIME}" 2>/dev/null | egrep "(PG_FULL_ARCH_${INSTANCENAME}_TAG|PG_ARCH_${INSTANCENAME}_TAG)" | tail -1)
+    FROM_SAVETIME=$(echo $FROM_SAVESET_INFO | sed 's/^[^ ]* //')
+    FROM_SAVENAME=$(echo $FROM_SAVESET_INFO | cut -d" " -f1)
+    TO_SAVESET_INFO=$(mminfo -s $NSR_SERVER -oRt -r 'name,savetime(22)' -q "client=${NSR_CLIENT},${SAVEGROUP_QUERY},savetime>=${NSR_UNTIL_TIME}" 2>/dev/null | egrep "(PG_FULL_ARCH_${INSTANCENAME}_TAG|PG_ARCH_${INSTANCENAME}_TAG)" | tail -1)
+    TO_SAVETIME=$(echo $TO_SAVESET_INFO | sed 's/^[^ ]* //')
+    TO_SAVENAME=$(echo $TO_SAVESET_INFO | cut -d" " -f1)
+  fi
+
+  if [ "$FROM_SAVETIME" != "" -a "$TO_SAVETIME" != "" ]; then
+    echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} Ready to restore all WAL archives from $FROM_SAVENAME ($FROM_SAVETIME) until $TO_SAVENAME ($TO_SAVETIME) save sets"
+  else
+    echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_ERROR} Cannot find a backup for the specified time $FROM_TIME or $UNTIL_TIME"
+    exit 1
+  fi
+
+fi
+
+
+#
+# restore WAL file archives
+#
+
+SAVESETS_TO_RESTORE=$(mminfo -s $NSR_SERVER -oRt -r 'name' -q "client=${NSR_CLIENT},${SAVEGROUP_QUERY},savetime>=${FROM_SAVETIME},savetime<=${TO_SAVETIME}" 2>/dev/null | egrep "(PG_FULL_ARCH_${INSTANCENAME}_TAG|PG_ARCH_${INSTANCENAME}_TAG)" | sed '1!G;h;$!d')
+
+echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} The following save sets will be restored:"
+
+for SAVESETNAME in ${SAVESETS_TO_RESTORE} ; do
+  echo "$SAVESETNAME"
+done
+
+for SAVESETNAME in ${SAVESETS_TO_RESTORE} ; do
+
+  mkdir -p $RESTORE_DIR
+  cd $RESTORE_DIR
+  ln -s $RESTORE_DIR $(basename $SAVESETNAME)
+
+  mkfifo $RESTORE_DIR/NSR_PG_PIPE
+  
+  COMMAND="cat $RESTORE_DIR/NSR_PG_PIPE | tar --extract --dereference --ignore-zero --file - &"
+  echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} running $COMMAND"
+  eval $COMMAND
+
+  COMMAND="$RECOVER -f -d $RESTORE_DIR -a $SAVESETNAME/NSR_PG_PIPE -c $NSR_CLIENT"
+  echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} running $COMMAND"
+  eval $COMMAND
+
+  RC=$?
+
+  rm -f ${RESTORE_DIR}/$(basename $SAVESETNAME)
+  rm -f $RESTORE_DIR/NSR_PG_PIPE $RESTORE_DIR/.nsr
+
+  if [ $RC -ne 0 ]; then
+    echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_ERROR} error occured during recovery of $SAVESETNAME"
+    exit 1 
+  fi
+
+  echo
+  if [ -z "$RESTORE_DIR" ]; then
+    echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} Restored into $SAVESETNAME"
+  else
+    echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} Restored into $RESTORE_DIR"
+  fi
+
+done
+
+echo
+echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} $SCRIPT completed at $(date +%Y-%m-%d_%H:%M:%S)"
+echo
+
+exit 0
+

@@ -1,0 +1,167 @@
+#!/bin/sh
+# File: pg_nsr_backup_list.sh
+#
+# List NetWorker backups for a specified client 
+#
+# History:
+#
+# Date       Author       Comments
+# ---------- ------------ ----------------------------------------------
+# 25/10/2018 KLewandowski Created
+# ----------------------------------------------------------------------
+#
+
+
+#
+# Variables
+#
+
+DIR=$(dirname $0)
+NSR_SERVER=$(awk ' $1!~ /[#*]/ {print $1} ' /nsr/res/servers 2>/dev/null| head -1)
+NSR_CLIENT="$(hostname -s)-nsr.$(echo $NSR_SERVER | awk -F. '{$1="";OFS="." ; print $0}' | sed 's/^.//')"
+VERBOSE=0
+ECHO_INFO="INFO> "
+SAVETIME="last day"
+
+#
+# Parameters (default values)
+#
+DEFAULT_SAVEGROUP="{{ postgresql_nsr_backup_default_savegroup_prefix }}_INSTANCENAME_$(hostname -s)_dbfull"
+
+#
+# Functions
+#
+
+function usage()
+{
+  cat <<EOT
+
+List NetWorker backups for a specified client
+
+Usage:
+  $0 [OPTION]...
+
+Options:
+   -h, --help                    show this help, then exit (optional)
+   -v, --verbose                 verbose mode (optional)
+   -i, --instance=INSTANCENAME   list backups for this PostgreSQL instance (optional)
+   -g, --savegroup=SAVEGROUP     list backups for this NetWorker save group (optional) [default: ${DEFAULT_SAVEGROUP}]
+   -c, --backup-client=CLIENT    name of the machine that saved the files (optional) [default: $(hostname -s)]
+   -t, --savetime=SAVETIME       list backups completed since SAVETIME (optional) [default: ${SAVETIME}]
+                                   e.g. "last day" | "4 days ago" | "last week" | "2 weeks ago" | "1 month ago"
+
+EOT
+}
+
+
+#
+# args parsing
+#
+
+while (( "$#" )); do
+  case "$1" in
+    -i)
+      INSTANCENAME=$2
+      shift 2
+      ;;
+    --instance=*)
+      INSTANCENAME="${1#*=}"
+      shift
+      ;;
+    -c)
+      BACKUP_CLIENT=$2
+      shift 2
+      ;;
+    --backup-client=*)
+      BACKUP_CLIENT="${1#*=}"
+      shift
+      ;;
+    -g)
+      SAVEGROUP=$2
+      shift 2
+      ;;
+    --savegroup=*)
+      SAVEGROUP="${1#*=}"
+      shift
+      ;;
+    -t)
+      SAVETIME=$2
+      shift 2
+      ;;
+    --savetime=*)
+      SAVETIME="${1#*=}"
+      shift
+      ;;
+    -v|--verbose)
+      VERBOSE=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      shift
+      exit 0
+      ;;
+    -*|--*=) # unsupported flags
+      echo "ERROR: Unsupported flag $1" >&2
+      usage
+      exit 1
+      ;;
+    *)
+      echo "ERROR: Unknown parameter $1" >&2
+      usage
+      exit 1
+      ;;
+  esac
+done
+
+
+#
+# The real stuff starts here
+#
+
+echo
+echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} $SCRIPT started at $(date +%Y-%m-%d_%H:%M:%S)"
+echo
+
+if [ -z "$BACKUP_CLIENT" ]; then
+  BACKUP_CLIENT=$(hostname -s)
+fi
+
+NSR_CLIENT="${BACKUP_CLIENT}-nsr.$(echo $NSR_SERVER | awk -F. '{$1="";OFS="." ; print $0}' | sed 's/^.//')"
+
+if [ -z "$INSTANCENAME" ]; then
+  COMMAND="mminfo -s $NSR_SERVER -oRt -r 'name,group,savetime(22),totalsize(3),ssid' -q \"client=${NSR_CLIENT},savetime>=${SAVETIME}\""
+else
+  if [ ! -z "$SAVEGROUP" ]; then
+    COMMAND="mminfo -s $NSR_SERVER -oRt -r 'name,savetime(22),totalsize(3),ssid' -q \"client=${NSR_CLIENT},savetime>=${SAVETIME},group=${SAVEGROUP}\""
+  else
+    SAVEGROUPdbfull="{{ postgresql_nsr_backup_default_savegroup_prefix }}_${INSTANCENAME}_${BACKUP_CLIENT}_dbfull"
+    SAVEGROUPdbarch="{{ postgresql_nsr_backup_default_savegroup_prefix }}_${INSTANCENAME}_${BACKUP_CLIENT}_dbarch"
+    COMMAND="mminfo -s $NSR_SERVER -oRt -r 'name,savetime(22),totalsize(3),ssid,volretent' -q \"client=${NSR_CLIENT},savetime>=${SAVETIME},group=${SAVEGROUPdbfull},group=${SAVEGROUPdbarch}\""
+  fi
+fi
+
+if [ $VERBOSE -eq 1 ]; then
+  echo "--> (PARAMETERS) :: INSTANCENAME:  $INSTANCENAME"
+  echo "--> (PARAMETERS) :: BACKUP_CLIENT: $BACKUP_CLIENT"
+  echo "--> (PARAMETERS) :: SAVEGROUP:     $SAVEGROUP"
+  echo "--> (PARAMETERS) :: SAVETIME:      $SAVETIME"
+  echo
+fi
+
+if [ $VERBOSE -eq 1 ]; then
+  echo "--> (NSR) :: NSR_SERVER:  $NSR_SERVER"
+  echo "--> (NSR) :: NSR_CLIENT:  $NSR_CLIENT"
+  echo
+fi
+
+echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} List last backups"
+echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} running $COMMAND"
+eval $COMMAND
+echo
+
+echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} $SCRIPT completed at $(date +%Y-%m-%d_%H:%M:%S)"
+echo
+
+exit 0
+

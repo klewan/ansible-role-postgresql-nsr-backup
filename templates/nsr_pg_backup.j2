@@ -1,0 +1,4 @@
+#!/bin/sh
+
+/bin/sudo -u {{ postgresql_user }} {{ postgresql_nsr_backup_nsr_scripts_directory }}/nsr_pg_backup.sh "$@" --verbose --log-dir={{ postgresql_nsr_backup_nsr_scripts_log_directory }}
+ 

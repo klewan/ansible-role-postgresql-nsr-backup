@@ -1,0 +1,139 @@
+#!/bin/sh
+# File: nsr_pg_backup_probe.sh
+#
+# Probe running PostgreSQL servers to trigger NetWorker backup
+#
+# History:
+#
+# Date       Author       Comments
+# ---------- ------------ ----------------------------------------------
+# 03/12/2018 KLewandowski Created
+# ----------------------------------------------------------------------
+#
+
+
+#
+# Variables
+#
+
+DIR=$(dirname $0)
+SCRIPT="$(basename $0 .sh)"
+
+
+#
+# Parameters (default values)
+#
+VERBOSE=0
+BACKUP_TYPE=FULL
+ECHO_INFO="INFO> "
+ECHO_ERROR="ERROR> "
+
+#
+# Functions
+#
+
+function usage()
+{
+  cat <<EOT
+
+Back up PostgreSQL cluster to EMC NetWorker using a named pipe
+
+Usage:
+  $0 [OPTION]...
+
+Options:
+   -h, --help                    show this help, then exit (optional)
+   -v, --verbose                 verbose mode (optional)
+   -i, --instance=INSTANCENAME   PostgreSQL instance to backup (mandatory)
+   -t, --backup-type=BACKUPTYPE  backup type (FULL|ARCH) (optional) [default: $BACKUP_TYPE]
+
+EOT
+}
+
+
+#
+# The real stuff starts here
+#
+
+#
+# args parsing
+#
+
+while (( "$#" )); do
+  case "$1" in
+    -i)
+      INSTANCENAME=$2
+      shift 2
+      ;;
+    --instance=*)
+      INSTANCENAME="${1#*=}"
+      shift
+      ;;
+    -t)
+      BACKUP_TYPE=$2
+      shift 2
+      ;;
+    --backup-type=*)
+      BACKUP_TYPE="${1#*=}"
+      shift
+      ;;
+    -v|--verbose)
+      VERBOSE=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      shift
+      exit 0
+      ;;
+    -*|--*=) # unsupported flags
+      echo "ERROR: Unsupported flag $1" >&2
+      usage
+      exit 1
+      ;;
+    *)
+      echo "ERROR: Unknown parameter $1" >&2
+      usage
+      exit 1
+      ;;
+  esac
+done
+
+echo
+echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} $SCRIPT started at $(date +%Y-%m-%d_%H:%M:%S)"
+
+if [ -z "$INSTANCENAME" ]; then
+  echo "ERROR: Mandatory parameter '--instance=INSTANCENAME' not provided"
+  usage
+  exit 1
+fi
+
+if [ $VERBOSE -eq 1 ]; then
+  echo "--> (PARAMETERS) :: INSTANCENAME: $INSTANCENAME"
+  echo "--> (PARAMETERS) :: BACKUP_TYPE: $BACKUP_TYPE"
+fi
+
+IS_INSTANCE_UP=0
+
+#
+# probe running PostgreSQL servers
+#
+for PG_SERVER_PID in $(pgrep -lf '/bin/postgres' | awk '{ print $1 }' ); do
+  if [ $(grep -i -w cluster_name /proc/${PG_SERVER_PID}/cwd/postgresql.auto.conf | cut -d= -f2 | grep -w $INSTANCENAME | wc -l) -gt 0 ]; then
+    IS_INSTANCE_UP=1
+  fi
+done
+
+if [ $IS_INSTANCE_UP -eq 0 ]; then
+  echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} $INSTANCENAME is down. Skipping backup.."
+  EXIT_CODE=1
+else
+  echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} $INSTANCENAME is up. Starting backup.."
+  EXIT_CODE=0
+fi
+
+echo "$(date +%Y-%m-%d_%H:%M:%S) - ${ECHO_INFO} $SCRIPT completed at $(date +%Y-%m-%d_%H:%M:%S)"
+echo
+
+exit $EXIT_CODE 
+

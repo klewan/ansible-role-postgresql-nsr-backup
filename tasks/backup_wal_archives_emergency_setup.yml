@@ -1,0 +1,36 @@
+---
+
+- name: WAL archives emergency | copy backup wal archives emergency script
+  template:
+    src: nsr_pg_backup_wal_archives_emergency.sh.j2
+    dest: "{{ postgresql_nsr_backup_nsr_scripts_directory }}/nsr_pg_backup_wal_archives_emergency.sh"
+    owner: "{{ postgresql_user }}"
+    group: "{{ postgresql_group }}"
+    mode: 0755
+  when: postgresql_nsr_backup_cron_copy_scripts
+  tags:
+    - postgresql_nsr_backup_scripts
+    - postgresql_nsr_backup_postgres_scripts
+    - postgresql_nsr_backup_emergency_script
+
+- name: WAL archives emergency | set up backup related cron jobs
+  cron:
+    name: "{{ item.name }}"
+    job: "{{ item.job }}"
+    minute: "{{ item.minute|default(omit) }}"
+    hour: "{{ item.hour|default(omit) }}"
+    day: "{{ item.day|default(omit) }}"
+    weekday: "{{ item.weekday|default(omit) }}"
+    month: "{{ item.month|default(omit) }}"
+    state: "{{ item.state|default('present',true) }}"
+    disabled: "{{ postgresql_nsr_backup_cron_disabled_item }}"
+  with_items:
+    - "{{ postgresql_nsr_backup_cron_config }}"
+  loop_control:
+    label: "job: {{ item.job }}, state: {{ item.state|default('present',true) }}, disabled: {{ postgresql_nsr_backup_cron_disabled_item }}]"
+  when: postgresql_nsr_backup_manage_cron_jobs
+  tags:
+    - postgresql_nsr_backup_scripts
+    - postgresql_nsr_backup_postgres_scripts
+    - postgresql_nsr_backup_emergency_script
+
